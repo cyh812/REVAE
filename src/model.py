@@ -130,9 +130,9 @@ class REVAE_V1(nn.Module):
             "count_logits": self.count_head(z_n),   # (B,11)
         }
         post = {
-            "mu_color": mu_c, "logvar_color": lv_c, "z_color": z_c,
-            "mu_shape": mu_s, "logvar_shape": lv_s, "z_shape": z_s,
-            "mu_count": mu_n, "logvar_count": lv_n, "z_count": z_n,
+            "mu_color": mu_c, "lv_color": lv_c, "z_color": z_c,
+            "mu_shape": mu_s, "lv_shape": lv_s, "z_shape": z_s,
+            "mu_count": mu_n, "lv_count": lv_n, "z_count": z_n,
         }
         return x_logits, post, heads
 
