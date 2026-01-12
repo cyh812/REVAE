@@ -15,15 +15,15 @@ class TrainConfig:
     lr: float = 1e-3
     beta_kl: float = 1.0
 
-    lam_color: float = 1.0
+    lam_color: float = 1.0 #损失函数中的权重
     lam_shape: float = 1.0
     lam_count: float = 1.0
 
     recon_loss: str = "bce_logits"  # "bce_logits" | "mse"
-    grad_clip_norm: Optional[float] = None
+    grad_clip_norm: Optional[float] = None # 梯度裁剪阈值，目前为None
 
-    use_amp: bool = False  # mixed precision
-    log_every: int = 20
+    use_amp: bool = False  #是否启用混合精度（AMP），GPU 上可加速/省显存
+    log_every: int = 20 #每多少个 step 打印一次训练日志
 
     ckpt_dir: str = "checkpoints"
     ckpt_name: str = "revae.pt"
@@ -35,7 +35,7 @@ class TrainConfig:
 # ----------------------------
 # Utilities
 # ----------------------------
-def _ensure_dir(path: str) -> None:
+def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
@@ -47,27 +47,6 @@ def kl_standard_normal(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
     # per-sample sum over dims
     kld_per = 0.5 * torch.sum(torch.exp(logvar) + mu**2 - 1.0 - logvar, dim=1)
     return kld_per.mean()
-
-
-def _get_key(d: Dict[str, Any], keys: Tuple[str, ...]) -> Any:
-    for k in keys:
-        if k in d:
-            return d[k]
-    raise KeyError(f"None of keys {keys} found in dict. Available keys: {list(d.keys())}")
-
-
-# 默认键名映射（如果你的 REVAE_V1 用了不同命名，改这里即可）
-KEYMAP = {
-    "mu_color": ("mu_color", "mu_c", "mu_col", "muColor"),
-    "lv_color": ("logvar_color", "lv_color", "log_var_color", "logvar_c", "lv_c", "logVarColor"),
-    "mu_shape": ("mu_shape", "mu_s", "mu_shp", "muShape"),
-    "lv_shape": ("logvar_shape", "lv_shape", "log_var_shape", "logvar_s", "lv_s", "logVarShape"),
-    "mu_count": ("mu_count", "mu_n", "mu_num", "mu_cnt", "muCount"),
-    "lv_count": ("logvar_count", "lv_count", "log_var_count", "logvar_n", "lv_n", "logVarCount"),
-    "color_logits": ("color_logits", "color_logit", "pred_color", "y_color"),
-    "shape_logits": ("shape_logits", "shape_logit", "pred_shape", "y_shape"),
-    "count_logits": ("count_logits", "count_logit", "num_logits", "pred_count", "y_count"),
-}
 
 
 def compute_losses(
@@ -88,19 +67,19 @@ def compute_losses(
     # 1) reconstruction
     if cfg.recon_loss == "bce_logits":
         # images must be in [0,1]
-        recon = F.binary_cross_entropy_with_logits(x_logits, images, reduction="sum") / B
+        recon = F.binary_cross_entropy_with_logits(x_logits, images, reduction="sum") / (B*images[0].numel())
     elif cfg.recon_loss == "mse":
-        recon = F.mse_loss(torch.sigmoid(x_logits), images, reduction="mean")
+        recon = F.mse_loss(torch.sigmoid(x_logits), images, reduction="mean") / (B*images[0].numel())
     else:
         raise ValueError(f"Unknown recon_loss: {cfg.recon_loss}")
 
     # 2) KL per group
-    mu_c = _get_key(post, KEYMAP["mu_color"])
-    lv_c = _get_key(post, KEYMAP["lv_color"])
-    mu_s = _get_key(post, KEYMAP["mu_shape"])
-    lv_s = _get_key(post, KEYMAP["lv_shape"])
-    mu_n = _get_key(post, KEYMAP["mu_count"])
-    lv_n = _get_key(post, KEYMAP["lv_count"])
+    mu_c = post["mu_color"]
+    lv_c = post["lv_color"]
+    mu_s = post["mu_shape"]
+    lv_s = post["lv_shape"]
+    mu_n = post["mu_count"]
+    lv_n = post["lv_count"]
 
     kl_c = kl_standard_normal(mu_c, lv_c)
     kl_s = kl_standard_normal(mu_s, lv_s)
@@ -108,9 +87,9 @@ def compute_losses(
     kl = kl_c + kl_s + kl_n
 
     # 3) supervised heads
-    color_logits = _get_key(heads, KEYMAP["color_logits"])
-    shape_logits = _get_key(heads, KEYMAP["shape_logits"])
-    count_logits = _get_key(heads, KEYMAP["count_logits"])
+    color_logits = heads["color_logits"]
+    shape_logits = heads["shape_logits"]
+    count_logits = heads["count_logits"]
 
     loss_color = F.binary_cross_entropy_with_logits(color_logits, color_mh, reduction="mean")
     loss_shape = F.binary_cross_entropy_with_logits(shape_logits, shape_mh, reduction="mean")
@@ -264,7 +243,7 @@ def save_checkpoint(
     best_metric: float,
     path: str,
 ) -> None:
-    _ensure_dir(os.path.dirname(path))
+    ensure_dir(os.path.dirname(path))
     torch.save(
         {
             "model": model.state_dict(),
