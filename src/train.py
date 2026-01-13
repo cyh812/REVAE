@@ -67,9 +67,11 @@ def compute_losses(
     # 1) reconstruction
     if cfg.recon_loss == "bce_logits":
         # images must be in [0,1]
-        recon = F.binary_cross_entropy_with_logits(x_logits, images, reduction="sum") / (B*images[0].numel())
+        recon = F.binary_cross_entropy_with_logits(x_logits, images, reduction="sum") / B
     elif cfg.recon_loss == "mse":
-        recon = F.mse_loss(torch.sigmoid(x_logits), images, reduction="mean") / (B*images[0].numel())
+        recon = F.mse_loss(torch.sigmoid(x_logits), images, reduction="mean")
+    elif cfg.recon_loss == "l1":
+        recon = F.l1_loss(torch.sigmoid(x_logits), images, reduction="mean")
     else:
         raise ValueError(f"Unknown recon_loss: {cfg.recon_loss}")
 
@@ -84,7 +86,7 @@ def compute_losses(
     kl_c = kl_standard_normal(mu_c, lv_c)
     kl_s = kl_standard_normal(mu_s, lv_s)
     kl_n = kl_standard_normal(mu_n, lv_n)
-    kl = kl_c + kl_s + kl_n
+    kl = (kl_c + kl_s + kl_n) / 3.0
 
     # 3) supervised heads
     color_logits = heads["color_logits"]
@@ -108,13 +110,13 @@ def compute_losses(
     logs = {
         "total": float(total.detach()),
         "recon": float(recon.detach()),
-        "kl": float(kl.detach()),
+        "kl": float(kl.detach()*cfg.beta_kl),
         "kl_color": float(kl_c.detach()),
         "kl_shape": float(kl_s.detach()),
         "kl_count": float(kl_n.detach()),
-        "loss_color": float(loss_color.detach()),
-        "loss_shape": float(loss_shape.detach()),
-        "loss_count": float(loss_count.detach()),
+        "loss_color": float(loss_color.detach()*cfg.lam_color),
+        "loss_shape": float(loss_shape.detach()*cfg.lam_shape),
+        "loss_count": float(loss_count.detach()*cfg.lam_count),
     }
     return total, logs
 
@@ -185,6 +187,11 @@ def train_one_epoch(
     # mean logs
     for k in agg:
         agg[k] /= max(n, 1)
+
+    # print(
+    #         f"[train] epoch {epoch}"
+    #             + " ".join([f"{k}={agg[k]:.4f}" for k in ("total", "recon", "kl", "loss_color", "loss_shape", "loss_count")])
+    #         )
     return agg
 
 
@@ -285,6 +292,7 @@ def fit(
     history = {"train": [], "val": []}
 
     for epoch in range(1, cfg.epochs + 1):
+        print(f"epoch{epoch}")
         train_logs = train_one_epoch(model, train_loader, optimizer, cfg, epoch)
         history["train"].append(train_logs)
 
