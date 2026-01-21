@@ -1,352 +1,155 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import torch  # 导入 PyTorch
+import torch.nn as nn  # 导入神经网络模块
+import torch.nn.functional as F  # 导入函数式接口（可选）
 
+class ConvGRUCell(nn.Module):  # 定义 ConvGRU 的单步 cell
+    def __init__(self, in_channels: int, hidden_channels: int, kernel_size: int = 3):  # 初始化
+        super().__init__()  # 调父类初始化
+        self.in_channels = in_channels  # 保存输入通道数
+        self.hidden_channels = hidden_channels  # 保存隐状态通道数
+        padding = kernel_size // 2  # same padding 让 H/W 不变
 
-# 第一版
-class REVAE_V1(nn.Module):
-    def __init__(
-        self,
-        z_color_dim=32,
-        z_shape_dim=32,
-        z_count_dim=32,
-        n_colors=8,
-        n_shapes=3,
-        n_count_classes=11, #数量从0~10，但数量为0其实不存在的
-    ):
-        super().__init__()
-
-        # 这四个维度一样
-        self.z_color_dim = z_color_dim
-        self.z_shape_dim = z_shape_dim
-        self.z_count_dim = z_count_dim
-        self.z_total_dim = z_color_dim
-
-        # -----------------------
-        # Encoder: 224 -> 7
-        # -----------------------
-        def conv_block(cin, cout):
-            return nn.Sequential(
-                nn.Conv2d(cin, cout, kernel_size=4, stride=2, padding=1),  # /2
-                # nn.BatchNorm2d(cout),
-                nn.ReLU(inplace=True),
-            )
-        
-        def deconv_block(cin, cout):
-            return nn.Sequential(
-                nn.ConvTranspose2d(cin, cout, kernel_size=4, stride=2, padding=1),  # x2
-                # nn.BatchNorm2d(cout),
-                nn.ReLU(inplace=True),
-            )
-
-        self.encoder = nn.Sequential(
-            conv_block(3, 32),     # B,32,112,112
-            conv_block(32, 64),    # B,64,56,56
-            conv_block(64, 128),   # B,128,28,28
-            conv_block(128, 256),  # B,256,14,14
-            conv_block(256, 512),  # B,512,7,7
+        self.conv_gates = nn.Conv2d(  # 门控卷积（同时算 z 和 r）
+            in_channels + hidden_channels,  # 输入：concat(x, h_prev)
+            2 * hidden_channels,  # 输出：z 和 r 两个门
+            kernel_size=kernel_size,  # 卷积核
+            padding=padding  # padding
         )
 
-        self.enc_fc = nn.Sequential(
-            nn.Flatten(),                          # (B, 512*7*7)
-            nn.Linear(512 * 7 * 7, 512),
-            nn.ReLU(inplace=True),
+        self.conv_candidate = nn.Conv2d(  # 候选隐状态卷积
+            in_channels + hidden_channels,  # 输入：concat(x, r*h_prev)
+            hidden_channels,  # 输出：h_tilde
+            kernel_size=kernel_size,  # 卷积核
+            padding=padding  # padding
         )
 
-        # posterior heads (mu/logvar) for each group
-        self.mu_color = nn.Linear(512, z_color_dim)
-        self.lv_color = nn.Linear(512, z_color_dim)
+    def forward(self, x_t: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:  # 单步前向
+        xh = torch.cat([x_t, h_prev], dim=1)  # 拼接输入和旧隐状态
+        gates = self.conv_gates(xh)  # 计算门控输出
+        z_gate, r_gate = torch.split(gates, self.hidden_channels, dim=1)  # 切分出 z/r
+        z = torch.sigmoid(z_gate)  # update gate
+        r = torch.sigmoid(r_gate)  # reset gate
 
-        self.mu_shape = nn.Linear(512, z_shape_dim)
-        self.lv_shape = nn.Linear(512, z_shape_dim)
+        rh = r * h_prev  # r ⊙ h_prev
+        x_rh = torch.cat([x_t, rh], dim=1)  # 拼接 x 和 r*h_prev
+        h_tilde = torch.tanh(self.conv_candidate(x_rh))  # 候选隐状态
 
-        self.mu_count = nn.Linear(512, z_count_dim)
-        self.lv_count = nn.Linear(512, z_count_dim)
+        h_new = (1 - z) * h_prev + z * h_tilde  # GRU 更新
+        return h_new  # 返回新隐状态
 
-        # -----------------------
-        # Decoder: 7 -> 224
-        # -----------------------
-        self.dec_fc = nn.Sequential(
-            nn.Linear(self.z_total_dim, 512 * 7 * 7),
-            nn.ReLU(inplace=True),
+
+class ConvStem(nn.Module):  # 普通卷积前端（类似 ResNet stem 的简化版）
+    def __init__(self, in_channels: int = 3, base_channels: int = 64):  # 初始化
+        super().__init__()  # 调父类初始化
+
+        self.conv1 = nn.Conv2d(  # 第一层卷积
+            in_channels,  # 输入通道 3
+            base_channels,  # 输出通道 64
+            kernel_size=7,  # 7x7 卷积
+            stride=2,  # 下采样到 112x112
+            padding=3,  # padding 保尺寸合理
+            bias=False  # 配合 BN 通常不需要 bias
         )
+        self.bn1 = nn.BatchNorm2d(base_channels)  # BN
+        self.relu = nn.ReLU(inplace=True)  # ReLU 激活
+        self.pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)  # 再下采样到 56x56
 
-        self.decoder = nn.Sequential(
-            deconv_block(512, 256),  # 7 -> 14
-            deconv_block(256, 128),  # 14 -> 28
-            deconv_block(128, 64),   # 28 -> 56
-            deconv_block(64, 32),    # 56 -> 112
-            nn.ConvTranspose2d(32, 3, kernel_size=4, stride=2, padding=1),  # 112 -> 224
+        self.conv2 = nn.Conv2d(  # 再接一层 3x3 卷积增强表征
+            base_channels,  # 输入 64
+            base_channels,  # 输出 64
+            kernel_size=3,  # 3x3
+            stride=1,  # 不下采样
+            padding=1,  # same padding
+            bias=False  # 不要 bias
         )
-        # 输出用 logits；重建时可用 BCEWithLogitsLoss 或先 sigmoid 后 MSE
+        self.bn2 = nn.BatchNorm2d(base_channels)  # BN
 
-        # -----------------------
-        # Heads (supervision)
-        # -----------------------
-        self.color_head = nn.Linear(z_color_dim, n_colors)           # multi-label logits
-        self.shape_head = nn.Linear(z_shape_dim, n_shapes)           # multi-label logits
-        self.count_head = nn.Linear(z_count_dim, n_count_classes)    # class logits
-
-    @staticmethod
-    def sample(mu, logvar):
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
-
-    # 放在类里面方便组织的普通函数
-    @staticmethod
-    def kl_standard_normal(mu, logvar):
-        # KL( N(mu,var) || N(0,I) )
-        # returns (B,)
-        return 0.5 * torch.sum(torch.exp(logvar) + mu**2 - 1.0 - logvar, dim=1)
-
-    def encode(self, x):
-        h = self.encoder(x)
-        h = self.enc_fc(h)
-
-        mu_c, lv_c = self.mu_color(h), self.lv_color(h)
-        mu_s, lv_s = self.mu_shape(h), self.lv_shape(h)
-        mu_n, lv_n = self.mu_count(h), self.lv_count(h)
-
-        z_c = self.sample(mu_c, lv_c)
-        z_s = self.sample(mu_s, lv_s)
-        z_n = self.sample(mu_n, lv_n)
-
-        return (mu_c, lv_c, z_c), (mu_s, lv_s, z_s), (mu_n, lv_n, z_n)
-
-    def decode(self, z_c, z_s, z_n):
-        z = z_c + z_s + z_n
-        h = self.dec_fc(z).view(-1, 512, 7, 7)
-        x_logits = self.decoder(h)  # (B,3,224,224)
-        return x_logits
-
-    def forward(self, x):
-        (mu_c, lv_c, z_c), (mu_s, lv_s, z_s), (mu_n, lv_n, z_n) = self.encode(x)
-        x_logits = self.decode(z_c, z_s, z_n)
-
-        heads = {
-            "color_logits": self.color_head(z_c),   # (B,8)
-            "shape_logits": self.shape_head(z_s),   # (B,3)
-            "count_logits": self.count_head(z_n),   # (B,11)
-        }
-        post = {
-            "mu_color": mu_c, "lv_color": lv_c, "z_color": z_c,
-            "mu_shape": mu_s, "lv_shape": lv_s, "z_shape": z_s,
-            "mu_count": mu_n, "lv_count": lv_n, "z_count": z_n,
-        }
-        return x_logits, post, heads
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # 前向
+        x = self.conv1(x)  # 7x7 卷积 + stride2
+        x = self.bn1(x)  # BN
+        x = self.relu(x)  # ReLU
+        x = self.pool(x)  # MaxPool -> 56x56
+        x = self.conv2(x)  # 3x3 卷积增强
+        x = self.bn2(x)  # BN
+        x = self.relu(x)  # ReLU
+        return x  # 返回 stem 特征 (B, 64, 56, 56)
 
 
-class TDVAE(nn.Module):
-    """
-    A PyTorch implementation matching the architecture we discussed:
+class TwoLayerConvGRUNet(nn.Module):  # 整体模型：stem + 两层 ConvGRU + head
+    def __init__(self, in_channels: int = 3, stem_channels: int = 64, h1_channels: int = 96, h2_channels: int = 128, num_classes: int = 8):
+        super().__init__()  # 调父类初始化
 
-    x [B,64,64,3]
-      -> 3*Conv (stride=2) => feat [B,128,8,8]
-      -> Flatten + MLP => hiddens [B,256]
-      -> q(y|x): 2*(FC+ReLU) + FC(linear) => (mu_y, logvar_y) with y_dim=10
-      -> q(z|x,y): y->emb(64) ; concat([hiddens, y_emb]) => [B,320]
-                 -> 2*(FC+ReLU) + FC(linear) => (mu_z, logvar_z) with z_dim=32
-      -> p(z|y): 2*(FC+ReLU) + FC(linear) => (mu_z_prior, logvar_z_prior)
-      -> p(x|z): 2*(FC+ReLU) -> reshape [B,128,8,8] -> upsample+conv blocks -> x_hat [B,3,64,64]
+        self.stem = ConvStem(in_channels=in_channels, base_channels=stem_channels)  # 普通卷积前端
 
-    Notes:
-    - Uses diagonal Gaussians (Normal) parameterized by (mu, logvar).
-    - Returns a dict with all key tensors so you can build losses externally.
-    """
-
-    def __init__(
-        self,
-        y_dim: int = 10,
-        z_dim: int = 32,
-        hidden_dim: int = 256,
-        y_emb_dim: int = 64,
-        img_channels: int = 3,
-        base_channels: int = 32,
-    ):
-        super().__init__()
-        self.y_dim = y_dim
-        self.z_dim = z_dim
-        self.hidden_dim = hidden_dim
-        self.y_emb_dim = y_emb_dim
-        self.img_channels = img_channels
-
-        # -------- Shared conv encoder: [B,3,64,64] -> [B,128,8,8] --------
-        # Conv1: 64 -> 32
-        # Conv2: 32 -> 16
-        # Conv3: 16 -> 8
-        self.enc_conv = nn.Sequential(
-            nn.Conv2d(img_channels, base_channels, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(base_channels, base_channels * 2, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(base_channels * 2, base_channels * 4, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
+        self.pre1 = nn.Conv2d(  # 把 stem 的输出通道映射到 RNN1 的输入通道
+            stem_channels,  # 输入 64
+            h1_channels,  # 输出到 96
+            kernel_size=1,  # 1x1 变换通道
+            stride=1,  # 不改变分辨率
+            padding=0,  # 无 padding
+            bias=False  # 不用 bias
         )
-        self.enc_feat_channels = base_channels * 4  # 128 if base_channels=32
-        self.enc_feat_hw = 8
-        self.enc_feat_dim = self.enc_feat_channels * self.enc_feat_hw * self.enc_feat_hw  # 128*8*8=8192
+        self.bn_pre1 = nn.BatchNorm2d(h1_channels)  # BN
+        self.rnn1 = ConvGRUCell(in_channels=h1_channels, hidden_channels=h1_channels, kernel_size=3)  # 第一层 ConvGRU（56x56）
 
-        # Flatten + MLP -> hiddens [B,256]
-        self.enc_mlp = nn.Sequential(
-            nn.Linear(self.enc_feat_dim, hidden_dim),
-            nn.ReLU(inplace=True),
+        self.down12 = nn.Conv2d(  # 从 56x56 下采样到 28x28，并变换通道到 h2_channels
+            h1_channels,  # 输入 96
+            h2_channels,  # 输出 128
+            kernel_size=3,  # 3x3
+            stride=2,  # stride2 下采样
+            padding=1,  # same padding
+            bias=False  # 不用 bias
         )
+        self.bn_down12 = nn.BatchNorm2d(h2_channels)  # BN
+        self.rnn2 = ConvGRUCell(in_channels=h2_channels, hidden_channels=h2_channels, kernel_size=3)  # 第二层 ConvGRU（28x28）
 
-        # -------- q(y|x): hiddens -> (mu_y, logvar_y) --------
-        self.qy = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 2 * y_dim),  # outputs [mu_y, logvar_y]
-        )
+        self.head_color = nn.Linear(h2_channels, num_classes)
+        self.head_count = nn.Linear(h2_channels, 11 )
+        self.head_per_color = nn.Linear(h2_channels, 8 * 11)
 
-        # -------- q(z|x,y): y -> y_emb (64), concat with hiddens -> (mu_z, logvar_z) --------
-        self.y_to_emb = nn.Sequential(
-            nn.Linear(y_dim, y_emb_dim),
-            nn.ReLU(inplace=True),
-        )
-        self.qz = nn.Sequential(
-            nn.Linear(hidden_dim + y_emb_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 2 * z_dim),  # outputs [mu_z, logvar_z]
-        )
+    def forward(self, x: torch.Tensor, steps: int = 3):
+        # x: (B, 3, 224, 224)  # 输入图像
+        # steps: 迭代次数（模拟循环推理）  # 比如 3、5、8
+        # return_all: 是否返回每一步的 h1/h2 轨迹（用于可视化/调试）
 
-        # -------- p(z|y): y -> (mu_z_prior, logvar_z_prior) --------
-        self.pz = nn.Sequential(
-            nn.Linear(y_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 2 * z_dim),
-        )
+        B, C, H, W = x.shape  # 解析输入维度
 
-        # -------- p(x|z): z -> [B,128,8,8] -> upsample+conv to [B,3,64,64] --------
-        self.dec_mlp = nn.Sequential(
-            nn.Linear(z_dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, self.enc_feat_dim),
-            nn.ReLU(inplace=True),
-        )
+        feat = self.stem(x)  # stem 提取特征 -> (B, 64, 56, 56)
 
-        # Upsample + Conv blocks (resize+conv)
-        # 8 -> 16 -> 32 -> 64
-        self.dec_up1 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="nearest"),
-            nn.Conv2d(self.enc_feat_channels, self.enc_feat_channels, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-        )
-        self.dec_up2 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="nearest"),
-            nn.Conv2d(self.enc_feat_channels, self.enc_feat_channels // 2, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-        )
-        self.dec_up3 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode="nearest"),
-            nn.Conv2d(self.enc_feat_channels // 2, self.enc_feat_channels // 4, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-        )
-        self.dec_out = nn.Conv2d(self.enc_feat_channels // 4, img_channels, kernel_size=3, stride=1, padding=1)
+        x1 = self.pre1(feat)  # 通道映射 -> (B, 96, 56, 56)
+        x1 = self.bn_pre1(x1)  # BN
+        x1 = F.relu(x1, inplace=True)  # ReLU
 
-    @staticmethod
-    def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """z = mu + std * eps"""
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + std * eps
+        h1 = torch.zeros(B, x1.shape[1], x1.shape[2], x1.shape[3], device=x.device, dtype=x.dtype)  # 初始化 h1 为 0
+        h2 = torch.zeros(B, 128, x1.shape[2] // 2, x1.shape[3] // 2, device=x.device, dtype=x.dtype)  # 初始化 h2 为 0（28x28）
 
-    def encode_shared(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: [B,3,64,64]
-        returns hiddens: [B,256]
-        """
-        feat = self.enc_conv(x)  # [B,128,8,8]
-        feat_flat = feat.flatten(1)  # [B,8192]
-        h = self.enc_mlp(feat_flat)  # [B,256]
-        return h
+        logits_colors = []  # 保存每一步color
+        logits_counts = []
+        logits_per_colors = []
 
-    def infer_y(self, hiddens: torch.Tensor):
-        """
-        hiddens: [B,256]
-        returns mu_y, logvar_y, y_sample
-        """
-        logits = self.qy(hiddens)  # [B, 2*y_dim]
-        mu_y, logvar_y = torch.chunk(logits, 2, dim=1)
-        y = self.reparameterize(mu_y, logvar_y)
-        return mu_y, logvar_y, y
+        for t in range(steps):  # 迭代 steps 次（输入不变，状态更新）
+            h1 = self.rnn1(x1, h1)  # 第一层 ConvGRU 更新（56x56）
 
-    def infer_z_posterior(self, hiddens: torch.Tensor, y: torch.Tensor):
-        """
-        q(z|x,y)
-        hiddens: [B,256]
-        y: [B,10]
-        returns mu_z, logvar_z, z_post
-        """
-        y_emb = self.y_to_emb(y)  # [B,64]
-        hy = torch.cat([hiddens, y_emb], dim=1)  # [B,320]
-        logits = self.qz(hy)  # [B, 2*z_dim]
-        mu_z, logvar_z = torch.chunk(logits, 2, dim=1)
-        z = self.reparameterize(mu_z, logvar_z)
-        return mu_z, logvar_z, z
+            x2 = self.down12(h1)  # 下采样 + 通道变换 -> (B, 128, 28, 28)
+            x2 = self.bn_down12(x2)  # BN
+            x2 = F.relu(x2, inplace=True)  # ReLU
 
-    def infer_z_prior(self, y: torch.Tensor):
-        """
-        p(z|y)
-        y: [B,10]
-        returns mu_z_prior, logvar_z_prior, z_prior_sample
-        """
-        logits = self.pz(y)  # [B, 2*z_dim]
-        mu, logvar = torch.chunk(logits, 2, dim=1)
-        z = self.reparameterize(mu, logvar)
-        return mu, logvar, z
+            h2 = self.rnn2(x2, h2)  # 第二层 ConvGRU 更新（28x28）
 
-    def decode_x(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        z: [B,32]
-        returns x_logits: [B,3,64,64]
-        (Apply sigmoid outside if you want Bernoulli mean)
-        """
-        flat = self.dec_mlp(z)  # [B,8192]
-        feat = flat.view(-1, self.enc_feat_channels, self.enc_feat_hw, self.enc_feat_hw)  # [B,128,8,8]
-        feat = self.dec_up1(feat)  # [B,128,16,16]
-        feat = self.dec_up2(feat)  # [B,64,32,32]
-        feat = self.dec_up3(feat)  # [B,32,64,64]
-        x_logits = self.dec_out(feat)  # [B,3,64,64]
-        return x_logits
+            pooled = F.adaptive_avg_pool2d(h2, output_size=1)  # GAP -> (B, 128, 1, 1)
+            pooled = pooled.view(B, -1)  # 展平 -> (B, 128)
+            # logits_color = self.head_color(pooled)  # 当前步 logits -> (B, 8)
+            logits_count = self.head_count(pooled)
+            # logits_per_color = self.head_per_color(pooled)
+            # logits_per_color = logits_per_color.view(B, 8, 11) 
 
-    def forward(self, x: torch.Tensor, sample_from: str = "posterior"):
-        """
-        x: [B,3,64,64]
-        sample_from: "posterior" or "prior"
-        Returns a dict containing:
-          hiddens, (mu_y, logvar_y, y),
-          (mu_z_post, logvar_z_post, z_post),
-          (mu_z_prior, logvar_z_prior, z_prior),
-          x_logits (decoded from chosen z)
-        """
-        h = self.encode_shared(x)
+            # logits_colors.append(logits_color)
+            logits_counts.append(logits_count)
+            # logits_per_colors.append(logits_per_color)
 
-        mu_y, logvar_y, y = self.infer_y(h)
-        mu_z_post, logvar_z_post, z_post = self.infer_z_posterior(h, y)
-        mu_z_pr, logvar_z_pr, z_pr = self.infer_z_prior(y)
+        # logits_colors = torch.stack(logits_colors, dim=1)  # 堆叠 -> (B, steps, 8)
+        logits_counts = torch.stack(logits_counts, dim=1)  # 堆叠 -> (B, steps, 11)
+        # logits_per_colors = torch.stack(logits_per_colors, dim=1)  # 堆叠 -> (B, steps, 8, 11)            
 
-        z_used = z_post if sample_from.lower() == "posterior" else z_pr
-        x_logits = self.decode_x(z_used)
-
-        return {
-            "hiddens": h,
-            "mu_y": mu_y,
-            "logvar_y": logvar_y,
-            "y": y,
-            "mu_z_post": mu_z_post,
-            "logvar_z_post": logvar_z_post,
-            "z_post": z_post,
-            "mu_z_prior": mu_z_pr,
-            "logvar_z_prior": logvar_z_pr,
-            "z_prior": z_pr,
-            "z_used": z_used,
-            "x_logits": x_logits,
-        }
+        # return logits_colors, logits_counts, logits_per_colors  # 返回每一步 logits
+        return logits_counts # 返回每一步 logits

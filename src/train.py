@@ -1,519 +1,429 @@
-import os
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Any
 
-import torch
-import torch.nn.functional as F
+import torch  # 导入 PyTorch
+import torch.nn as nn  # 导入 nn 模块
 
+from typing import Optional, Dict, Any  # 类型标注（可选）
 
-# ----------------------------
-# Config
-# ----------------------------
-@dataclass
-class TrainConfig:
-    epochs: int = 20
-    lr: float = 1e-3
-    beta_kl: float = 1.0
+def loss_color(  # 一个函数：loss + 每步严格对齐的对/错 count
+    logits_seq: torch.Tensor,            # (B, Step, 8) 每一步 logits
+    targets: torch.Tensor,               # (B, 8) multi-hot 标签（0/1）
+    mode: str = "last",                  # "last" | "all" | "weighted" | "last+aux"
+    threshold: float = 0.5,              # sigmoid 后阈值化
+    step_weights: torch.Tensor = None,   # (Step,) weighted 模式可选
+    aux_weight: float = 0.1,             # last+aux 模式可选
+    pos_weight: torch.Tensor = None,     # (8,) BCE pos_weight 可选
+):
+    B, S, C = logits_seq.shape  # 解析维度
+    targets = targets.float()  # BCEWithLogitsLoss 需要 float 标签
 
-    lam_color: float = 1.0 #损失函数中的权重
-    lam_shape: float = 1.0
-    lam_count: float = 1.0
-
-    recon_loss: str = "bce_logits"  # "bce_logits" | "mse"
-    grad_clip_norm: Optional[float] = None # 梯度裁剪阈值，目前为None
-
-    use_amp: bool = False  #是否启用混合精度（AMP），GPU 上可加速/省显存
-    log_every: int = 20 #每多少个 step 打印一次训练日志
-
-    ckpt_dir: str = "checkpoints"
-    ckpt_name: str = "revae.pt"
-    save_best: bool = True
-
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-
-@dataclass
-class TrainCfg:
-    epochs: int = 20
-    lr: float = 2e-4
-    weight_decay: float = 0.0
-    beta_y: float = 1.0
-    beta_z: float = 1.0
-    recon_type: str = "bce_logits"   # or "mse"
-    img_size: int = 64              # TDVAE currently assumes 64x64
-    grad_clip_norm: Optional[float] = 1.0
-    use_amp: bool = True
-    log_every: int = 50
-    sample_from: str = "posterior"  # "posterior" or "prior"
-
-    ckpt_dir: str = "checkpoints"
-    ckpt_name: str = "revae.pt"
-    save_best: bool = True
-
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-
-# ----------------------------
-# Utilities
-# ----------------------------
-def ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def kl_standard_normal(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-    """
-    KL( N(mu, var) || N(0, I) ) for diagonal Gaussian.
-    Returns scalar mean over batch (sum over dims, mean over batch).
-    """
-    # per-sample sum over dims
-    kld_per = 0.5 * torch.sum(torch.exp(logvar) + mu**2 - 1.0 - logvar, dim=1)
-    return kld_per
-
-def kl_prior_normal(mu_q:torch.Tensor, logvar_q:torch.Tensor, mu_p:torch.Tensor, logvar_p:torch.Tensor) -> torch.Tensor:
-    """
-    KL( N(mu_q, exp(logvar_q)) || N(mu_p, exp(logvar_p)) )
-    """
-    var_q = logvar_q.exp()
-    var_p = logvar_p.exp()
-    kld_per = 0.5 * torch.sum(
-        (logvar_p - logvar_q) + (var_q + (mu_q - mu_p).pow(2)) / var_p - 1.0,
-        dim=1
+    # ---------- 1) 计算 loss（可切换） ----------
+    loss_fn = nn.BCEWithLogitsLoss(  # BCEWithLogits = sigmoid + BCE
+        reduction="mean",  # 输出标量
+        pos_weight=pos_weight.to(logits_seq.device) if pos_weight is not None else None  # 可选：类别不均衡
     )
-    return kld_per
 
-def tdvae_loss(outputs, x, beta_y=1.0, beta_z=1.0, recon_type="bce_logits"):
-    """
-    outputs: dict from model.forward()
-    x: [B,3,64,64] in [0,1] if bce_logits
-    """
-    x_logits = outputs["x_logits"]
-
-    if recon_type == "bce_logits":
-        # sum over pixels/channels, then mean over batch
-        rec = F.binary_cross_entropy_with_logits(
-            x_logits, x, reduction="none"
-        ).flatten(1).sum(dim=1)  # [B]
-    elif recon_type == "mse":
-        x_hat = torch.sigmoid(x_logits)
-        rec = F.mse_loss(x_hat, x, reduction="none").flatten(1).sum(dim=1)  # [B]
+    if mode == "last":  # 只监督最后一步
+        loss = loss_fn(logits_seq[:, -1, :], targets)  # last-step loss
+    elif mode == "all":  # 每一步都监督，取平均
+        losses = []  # 存每步 loss
+        for t in range(S):  # 遍历 step
+            losses.append(loss_fn(logits_seq[:, t, :], targets))  # 计算当前步 loss
+        loss = torch.stack(losses, dim=0).mean()  # 平均成标量
+    elif mode == "weighted":  # 每一步监督，按权重加权
+        losses = []  # 存每步 loss
+        for t in range(S):  # 遍历 step
+            losses.append(loss_fn(logits_seq[:, t, :], targets))  # 当前步 loss
+        losses = torch.stack(losses, dim=0)  # (S,) 每步一个 loss
+        if step_weights is None:  # 如果没给权重
+            step_weights = torch.linspace(1.0, 2.0, steps=S, device=logits_seq.device)  # 默认后期更重
+        else:
+            step_weights = step_weights.to(logits_seq.device)  # 搬到 device
+            assert step_weights.shape == (S,), f"step_weights 必须是 (Step,)={S}"  # 检查形状
+        step_weights = step_weights / step_weights.sum()  # 归一化
+        loss = (losses * step_weights).sum()  # 加权求和
+    elif mode == "last+aux":  # 最后一步主导 + 早期步辅助
+        main_loss = loss_fn(logits_seq[:, -1, :], targets)  # 主损失：最后一步
+        if S == 1:  # 只有一步就直接返回
+            loss = main_loss  # 退化为 last
+        else:
+            aux_losses = []  # 存早期步 loss
+            for t in range(S - 1):  # 只遍历早期步
+                aux_losses.append(loss_fn(logits_seq[:, t, :], targets))  # 早期步 loss
+            aux_loss = torch.stack(aux_losses, dim=0).mean()  # 早期步平均
+            loss = main_loss + aux_weight * aux_loss  # 合成总 loss
     else:
-        raise ValueError("recon_type must be 'bernoulli' or 'mse'")
+        raise ValueError("mode 必须是 'last' | 'all' | 'weighted' | 'last+aux'")  # 报错
 
-    kl_y = kl_standard_normal(outputs["mu_y"], outputs["logvar_y"])  # [B]
-    kl_z = kl_prior_normal(
-        outputs["mu_z_post"], outputs["logvar_z_post"],
-        outputs["mu_z_prior"], outputs["logvar_z_prior"]
-    )  # [B]
+    # ---------- 2) 计算每一步 strict correct/wrong counts ----------
+    with torch.no_grad():  # 统计不需要梯度
+        probs = torch.sigmoid(logits_seq)  # (B, S, 8) 转概率（仅用于阈值化）
+        preds = (probs >= threshold).float()  # (B, S, 8) 阈值化得到 0/1
 
-    loss = (rec + beta_y * kl_y + beta_z * kl_z).mean()
+        correct_counts = torch.zeros(S, device=logits_seq.device)  # (S,) 每步全对数量
+        wrong_counts = torch.zeros(S, device=logits_seq.device)  # (S,) 每步非全对数量
 
-    return {
-        "loss": loss,
-        "rec": rec.mean(),
-        "kl_y": kl_y.mean(),
-        "kl_z": kl_z.mean(),
-    }
+        for t in range(S):  # 遍历每一步
+            eq = (preds[:, t, :] == targets)  # (B, 8) 每一位是否正确
+            all_ok = eq.all(dim=1)  # (B,) 每张图是否 8 位全对
+            n_ok = all_ok.sum()  # 全对数量
+            correct_counts[t] = n_ok  # 记录 correct
+            wrong_counts[t] = B - n_ok  # 记录 wrong
+ 
+    return loss, correct_counts, wrong_counts  # 返回：loss + 每步 n_correct/n_wrong（用于 epoch 累加）
 
-# def compute_losses(
-#     images: torch.Tensor,
-#     x_logits: torch.Tensor,
-#     post: Dict[str, Any],
-#     heads: Dict[str, Any],
-#     color_mh: torch.Tensor,
-#     shape_mh: torch.Tensor,
-#     count_oh: torch.Tensor,
-#     cfg: TrainConfig,
-# ) -> Tuple[torch.Tensor, Dict[str, float]]:
-#     """
-#     Total loss = recon + beta*KL + supervised heads losses
-#     """
-#     B = images.size(0)
+def loss_count(  # one-hot count 的 loss + 每步对/错统计
+    logits_seq: torch.Tensor,            # (B, Step, 11) 每一步 logits
+    targets_oh: torch.Tensor,            # (B, 11) one-hot 标签（0..10）
+    mode: str = "last",                  # "last" | "all" | "weighted" | "last+aux"
+    step_weights: Optional[torch.Tensor] = None,  # (Step,) weighted 模式可选
+    aux_weight: float = 0.1,             # last+aux 模式可选
+):
+    B, S, K = logits_seq.shape  # B=batch, S=step, K=11 类
 
-#     # 1) reconstruction
-#     if cfg.recon_loss == "bce_logits":
-#         # images must be in [0,1]
-#         recon = F.binary_cross_entropy_with_logits(x_logits, images, reduction="sum") / B
-#     elif cfg.recon_loss == "mse":
-#         recon = F.mse_loss(torch.sigmoid(x_logits), images, reduction="mean")
-#     elif cfg.recon_loss == "l1":
-#         recon = F.l1_loss(torch.sigmoid(x_logits), images, reduction="mean")
-#     else:
-#         raise ValueError(f"Unknown recon_loss: {cfg.recon_loss}")
+    # --- one-hot -> class index (B,) ---
+    # 假设 targets_oh 每行恰好一个 1（否则 argmax 仍会给一个 index，但语义不严谨）
+    targets_idx = targets_oh.argmax(dim=1).long()  # (B,)
 
-#     # 2) KL per group
-#     mu_c = post["mu_color"]
-#     lv_c = post["lv_color"]
-#     mu_s = post["mu_shape"]
-#     lv_s = post["lv_shape"]
-#     mu_n = post["mu_count"]
-#     lv_n = post["lv_count"]
+    # ---------- 1) 计算 loss（可切换） ----------
+    loss_fn = nn.CrossEntropyLoss(reduction="mean")  # CE 输入 logits, target=类别index
 
-#     kl_c = kl_standard_normal(mu_c, lv_c)
-#     kl_s = kl_standard_normal(mu_s, lv_s)
-#     kl_n = kl_standard_normal(mu_n, lv_n)
-#     kl = (kl_c + kl_s + kl_n) / 3.0
+    if mode == "last":  # 只监督最后一步
+        loss = loss_fn(logits_seq[:, -1, :], targets_idx)  # last-step CE
+    elif mode == "all":  # 每一步都监督，取平均
+        losses = []
+        for t in range(S):
+            losses.append(loss_fn(logits_seq[:, t, :], targets_idx))
+        loss = torch.stack(losses, dim=0).mean()
+    elif mode == "weighted":  # 每一步监督，按权重加权
+        losses = []
+        for t in range(S):
+            losses.append(loss_fn(logits_seq[:, t, :], targets_idx))
+        losses = torch.stack(losses, dim=0)  # (S,)
+        if step_weights is None:
+            step_weights = torch.linspace(1.0, 2.0, steps=S, device=logits_seq.device)
+        else:
+            step_weights = step_weights.to(logits_seq.device)
+            assert step_weights.shape == (S,), f"step_weights 必须是 (Step,)={S}"
+        step_weights = step_weights / step_weights.sum()
+        loss = (losses * step_weights).sum()
+    elif mode == "last+aux":  # 最后一步主导 + 早期步辅助
+        main_loss = loss_fn(logits_seq[:, -1, :], targets_idx)
+        if S == 1:
+            loss = main_loss
+        else:
+            aux_losses = []
+            for t in range(S - 1):
+                aux_losses.append(loss_fn(logits_seq[:, t, :], targets_idx))
+            aux_loss = torch.stack(aux_losses, dim=0).mean()
+            loss = main_loss + aux_weight * aux_loss
+    else:
+        raise ValueError("mode 必须是 'last' | 'all' | 'weighted' | 'last+aux'")
 
-#     # 3) supervised heads
-#     color_logits = heads["color_logits"]
-#     shape_logits = heads["shape_logits"]
-#     count_logits = heads["count_logits"]
+    # ---------- 2) 每一步 strict correct/wrong counts ----------
+    with torch.no_grad():
+        pred_idx = logits_seq.argmax(dim=2)  # (B, S) 每一步预测类别
+        correct_counts = torch.zeros(S, device=logits_seq.device)  # (S,)
+        wrong_counts = torch.zeros(S, device=logits_seq.device)    # (S,)
 
-#     loss_color = F.binary_cross_entropy_with_logits(color_logits, color_mh, reduction="mean")
-#     loss_shape = F.binary_cross_entropy_with_logits(shape_logits, shape_mh, reduction="mean")
+        for t in range(S):
+            ok = (pred_idx[:, t] == targets_idx)  # (B,)
+            n_ok = ok.sum()
+            correct_counts[t] = n_ok
+            wrong_counts[t] = B - n_ok
 
-#     count_cls = count_oh.argmax(dim=1)  # (B,)
-#     loss_count = F.cross_entropy(count_logits, count_cls, reduction="mean")
+    return loss, correct_counts, wrong_counts
 
-#     total = (
-#         recon
-#         + cfg.beta_kl * kl
-#         + cfg.lam_color * loss_color
-#         + cfg.lam_shape * loss_shape
-#         + cfg.lam_count * loss_count
-#     )
+def loss_per_color_count(
+    logits_seq: torch.Tensor,            # (B, Step, 8, 11)
+    targets_oh: torch.Tensor,            # (B, 8, 11)
+    mode: str = "last",                  # "last" | "all" | "weighted" | "last+aux"
+    step_weights: Optional[torch.Tensor] = None,  # (Step,)
+    aux_weight: float = 0.1,             # last+aux
+    return_micro: bool = False,           # 是否额外返回 micro acc（按颜色位点） 按颜色粒度统计（总共 B*8 个颜色位点，预测对多少）
+):
+    B, S, K8, K11 = logits_seq.shape  # B=batch, S=step, K8=8 colors, K11=11 classes
+    assert targets_oh.shape == (B, K8, K11), f"targets_oh 应为 (B,8,11)，但得到 {targets_oh.shape}"
 
-#     logs = {
-#         "total": float(total.detach()),
-#         "recon": float(recon.detach()),
-#         "kl": float(kl.detach()*cfg.beta_kl),
-#         "kl_color": float(kl_c.detach()),
-#         "kl_shape": float(kl_s.detach()),
-#         "kl_count": float(kl_n.detach()),
-#         "loss_color": float(loss_color.detach()*cfg.lam_color),
-#         "loss_shape": float(loss_shape.detach()*cfg.lam_shape),
-#         "loss_count": float(loss_count.detach()*cfg.lam_count),
-#     }
-#     return total, logs
+    # --- one-hot -> class index: (B, 8) ---
+    targets_idx = targets_oh.argmax(dim=2).long()  # 每个颜色的数量类别 0..10
 
+    # ---------- 1) loss（可切换） ----------
+    # CE 输入：(N, C) logits + (N,) target_index
+    loss_fn = nn.CrossEntropyLoss(reduction="mean")
 
-# # ----------------------------
-# # Train / Eval
-# # ----------------------------
-# def train_one_epoch(
-#     model: torch.nn.Module,
-#     loader: torch.utils.data.DataLoader,
-#     optimizer: torch.optim.Optimizer,
-#     cfg: TrainConfig,
-#     epoch: int,
-# ) -> Dict[str, float]:
-#     model.train()
-#     device = torch.device(cfg.device)
+    def step_ce(t: int) -> torch.Tensor:
+        # logits_t: (B, 8, 11) -> reshape 为 (B*8, 11)
+        logits_t = logits_seq[:, t, :, :].reshape(B * K8, K11)
+        targets_t = targets_idx.reshape(B * K8)
+        return loss_fn(logits_t, targets_t)
 
-#     scaler = torch.cuda.amp.GradScaler(enabled=(cfg.use_amp and device.type == "cuda"))
+    if mode == "last":
+        loss = step_ce(S - 1)
+    elif mode == "all":
+        losses = [step_ce(t) for t in range(S)]
+        loss = torch.stack(losses, dim=0).mean()
+    elif mode == "weighted":
+        losses = [step_ce(t) for t in range(S)]
+        losses = torch.stack(losses, dim=0)  # (S,)
+        if step_weights is None:
+            step_weights = torch.linspace(1.0, 2.0, steps=S, device=logits_seq.device)
+        else:
+            step_weights = step_weights.to(logits_seq.device)
+            assert step_weights.shape == (S,), f"step_weights 必须是 (Step,)={S}"
+        step_weights = step_weights / step_weights.sum()
+        loss = (losses * step_weights).sum()
+    elif mode == "last+aux":
+        main_loss = step_ce(S - 1)
+        if S == 1:
+            loss = main_loss
+        else:
+            aux_losses = [step_ce(t) for t in range(S - 1)]
+            aux_loss = torch.stack(aux_losses, dim=0).mean()
+            loss = main_loss + aux_weight * aux_loss
+    else:
+        raise ValueError("mode 必须是 'last' | 'all' | 'weighted' | 'last+aux'")
 
-#     agg = {}
-#     n = 0
+    # ---------- 2) 统计每一步 strict correct/wrong（按 batch 图片为单位） ----------
+    with torch.no_grad():
+        # pred_idx: (B, S, 8)
+        pred_idx = logits_seq.argmax(dim=3)  # 对 11 类取 argmax
+        correct_counts = torch.zeros(S, device=logits_seq.device)
+        wrong_counts = torch.zeros(S, device=logits_seq.device)
 
-#     for step, batch in enumerate(loader):
-#         images, color_mh, shape_mh, count_oh, _img_fns = batch
+        micro_acc = torch.zeros(S, device=logits_seq.device) if return_micro else None
 
-#         images = images.to(device, non_blocking=True)
-#         color_mh = color_mh.to(device, non_blocking=True).float()
-#         shape_mh = shape_mh.to(device, non_blocking=True).float()
-#         count_oh = count_oh.to(device, non_blocking=True).float()
+        for t in range(S):
+            # per_color_ok: (B, 8)
+            per_color_ok = (pred_idx[:, t, :] == targets_idx)
 
-#         optimizer.zero_grad(set_to_none=True)
+            # strict：一张图 8 个颜色全对才算对 -> (B,)
+            all_ok = per_color_ok.all(dim=1)
+            n_ok = all_ok.sum()
+            correct_counts[t] = n_ok
+            wrong_counts[t] = B - n_ok
 
-#         with torch.cuda.amp.autocast(enabled=(cfg.use_amp and device.type == "cuda")):
-#             out = model(images)
+            # micro：按颜色位点统计正确率（B*8 个位置）
+            if return_micro:
+                micro_acc[t] = per_color_ok.float().mean()
 
-#             # 兼容 forward 返回 (x_logits, post, heads) 或 dict
-#             if isinstance(out, (tuple, list)) and len(out) == 3:
-#                 x_logits, post, heads = out
-#             elif isinstance(out, dict):
-#                 x_logits = out["x_logits"]
-#                 post = out["post"]
-#                 heads = out["heads"]
-#             else:
-#                 raise RuntimeError("Model forward output must be (x_logits, post, heads) or dict with keys.")
+    return loss, correct_counts, wrong_counts, (micro_acc.detach().cpu() if return_micro else None)
 
-#             loss, logs = compute_losses(images, x_logits, post, heads, color_mh, shape_mh, count_oh, cfg)
-
-#         scaler.scale(loss).backward()
-
-#         if cfg.grad_clip_norm is not None:
-#             scaler.unscale_(optimizer)
-#             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
-
-#         scaler.step(optimizer)
-#         scaler.update()
-
-#         # aggregate logs
-#         for k, v in logs.items():
-#             agg[k] = agg.get(k, 0.0) + v
-#         n += 1
-
-#         # if cfg.log_every and (step % cfg.log_every == 0):
-#         #     print(
-#         #         f"[train] epoch {epoch} step {step}/{len(loader)} "
-#         #         + " ".join([f"{k}={logs[k]:.4f}" for k in ("total", "recon", "kl", "loss_color", "loss_shape", "loss_count")])
-#         #     )
-
-#     # mean logs
-#     for k in agg:
-#         agg[k] /= max(n, 1)
-
-#     print(
-#             f"[train] epoch {epoch}"
-#                 + " ".join([f"{k}={agg[k]:.4f}" for k in ("total", "recon", "kl", "loss_color", "loss_shape", "loss_count")])
-#             )
-#     return agg
-
-
-# @torch.no_grad()
-# def evaluate(
-#     model: torch.nn.Module,
-#     loader: torch.utils.data.DataLoader,
-#     cfg: TrainConfig,
-#     split_name: str = "val",
-# ) -> Dict[str, float]:
-#     model.eval()
-#     device = torch.device(cfg.device)
-
-#     agg = {}
-#     n = 0
-
-#     for batch in loader:
-#         images, color_mh, shape_mh, count_oh, _img_fns = batch
-
-#         images = images.to(device, non_blocking=True)
-#         color_mh = color_mh.to(device, non_blocking=True).float()
-#         shape_mh = shape_mh.to(device, non_blocking=True).float()
-#         count_oh = count_oh.to(device, non_blocking=True).float()
-
-#         out = model(images)
-#         if isinstance(out, (tuple, list)) and len(out) == 3:
-#             x_logits, post, heads = out
-#         elif isinstance(out, dict):
-#             x_logits = out["x_logits"]
-#             post = out["post"]
-#             heads = out["heads"]
-#         else:
-#             raise RuntimeError("Model forward output must be (x_logits, post, heads) or dict with keys.")
-
-#         loss, logs = compute_losses(images, x_logits, post, heads, color_mh, shape_mh, count_oh, cfg)
-
-#         for k, v in logs.items():
-#             agg[k] = agg.get(k, 0.0) + v
-#         n += 1
-
-#     for k in agg:
-#         agg[k] /= max(n, 1)
-
-#     print(
-#         f"[{split_name}] "
-#         + " ".join([f"{k}={agg[k]:.4f}" for k in ("total", "recon", "kl", "loss_color", "loss_shape", "loss_count")])
-#     )
-#     return agg
-
-@torch.no_grad()
-def recon_metrics_from_logits(x_logits: torch.Tensor, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-    """
-    Simple reconstruction metrics for monitoring.
-    """
-    x_hat = torch.sigmoid(x_logits)
-    mse = F.mse_loss(x_hat, x, reduction="mean")
-    bce = F.binary_cross_entropy(x_hat.clamp(1e-6, 1-1e-6), x, reduction="mean")
-    return {"mse": mse, "bce": bce}
-
-# ----------------------------
-# One epoch train
-# ----------------------------
 def train_one_epoch(
     model: torch.nn.Module,
-    train_dl: torch.utils.data.DataLoader,
+    dataloader: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
-    cfg: TrainCfg,
-) -> Dict[str, float]:
+    device: torch.device,
+    steps: int,
+    loss_mode: str = "last",
+    threshold: float = 0.5,
+    step_weights: Optional[torch.Tensor] = None,
+    aux_weight: float = 0.1,
+    pos_weight: Optional[torch.Tensor] = None,   # 只给 BCE 的 color presence 用
+    grad_clip_norm: Optional[float] = 1.0,
+) -> Dict[str, Any]:
     model.train()
-    device = torch.device(cfg.device)
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(cfg.use_amp and device.type == "cuda"))
-    # Running averages
-    sums = {"loss": 0.0, "rec": 0.0, "kl_y": 0.0, "kl_z": 0.0, "mse": 0.0, "bce": 0.0}
-    n_batches = 0
+    running_loss = 0.0
+    num_batches = 0
 
-    for step, batch in enumerate(train_dl):
-        # batch: images, color_mh, shape_mh, count_oh, img_fns
-        images = batch[0].to(device, non_blocking=True)
-        optimizer.zero_grad(set_to_none=True)
+    # ✅ 三套统计各自初始化
+    correct_sum_color = torch.zeros(steps, device=device)
+    wrong_sum_color   = torch.zeros(steps, device=device)
 
-        with torch.cuda.amp.autocast(enabled=cfg.use_amp):
-            outputs = model(images, sample_from=cfg.sample_from)
-            losses = tdvae_loss(
-                outputs, images,
-                beta_y=cfg.beta_y, beta_z=cfg.beta_z,
-                recon_type=cfg.recon_type
-            )
-            loss = losses["loss"]
+    correct_sum_count = torch.zeros(steps, device=device)
+    wrong_sum_count   = torch.zeros(steps, device=device)
 
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+    correct_sum_color_count = torch.zeros(steps, device=device)
+    wrong_sum_color_count   = torch.zeros(steps, device=device)
 
-        # Metrics (detach)
-        with torch.no_grad():
-            mets = recon_metrics_from_logits(outputs["x_logits"], images)
+    for step, batch in enumerate(dataloader):
+        images, color_mh, shape_mh, count_oh, color_count, shape_count = batch
 
-        for k in ["loss", "rec", "kl_y", "kl_z"]:
-            sums[k] += float(losses[k].detach().cpu())
-        sums["mse"] += float(mets["mse"].cpu())
-        sums["bce"] += float(mets["bce"].cpu())
-        n_batches += 1
+        images      = images.to(device)
+        # color_mh    = color_mh.to(device)
+        count_oh    = count_oh.to(device)
+        # color_count = color_count.to(device)
 
-    avg = {k: v / max(1, n_batches) for k, v in sums.items()}
-    print(" | ".join(f"{k}: {v:.4f}" for k, v in avg.items()))
-    return avg
+        # ✅ model 应该返回 3 个 logits 序列
+        logits_counts = model(images, steps=steps)
 
-# ----------------------------
-# Evaluation
-# ----------------------------
-@torch.no_grad()
-def evaluate(
-    model: torch.nn.Module,
-    val_dl: torch.utils.data.DataLoader,
-    cfg: TrainCfg,
-) -> Dict[str, float]:
-    model.eval()
-    device = torch.device(cfg.device)
+        # ===== loss 1: color presence (BCE) =====
+        # lc, corr_c, wrong_c = loss_color(
+        #     logits_seq=logits_colors,      # (B,S,8)
+        #     targets=color_mh,              # (B,8)
+        #     mode=loss_mode,
+        #     threshold=threshold,
+        #     step_weights=step_weights,
+        #     aux_weight=aux_weight,
+        #     pos_weight=pos_weight,         # ✅ 只有这里需要
+        # )
 
-    sums = {
-        "loss_post": 0.0, "rec_post": 0.0, "kl_y": 0.0, "kl_z": 0.0, "mse_post": 0.0, "bce_post": 0.0,
-        "mse_prior": 0.0, "bce_prior": 0.0, "rec_prior_proxy": 0.0,
+        # ===== loss 2: total count (CE) =====
+        lcnt, corr_cnt, wrong_cnt = loss_count(
+            logits_seq=logits_counts,      # (B,S,11)
+            targets_oh=count_oh,           # (B,11)
+            mode=loss_mode,
+            step_weights=step_weights,
+            aux_weight=aux_weight,
+        )
+
+        # ===== loss 3: per-color count (CE) =====
+        # 注意：我之前函数名叫 loss_per_color_count，targets_oh shape=(B,8,11)
+        # lpc, corr_pc, wrong_pc, _micro = loss_per_color_count(
+        #     logits_seq=logits_color_count, # (B,S,8,11)
+        #     targets_oh=color_count,        # (B,8,11)
+        #     mode=loss_mode,
+        #     step_weights=step_weights,
+        #     aux_weight=aux_weight,
+        #     return_micro=False,            # 先不统计 micro 也行
+        # )
+
+        # loss_total = lc + lcnt + lpc
+        loss_total = lcnt
+
+        optimizer.zero_grad()
+        loss_total.backward()
+
+        if grad_clip_norm is not None:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
+
+        optimizer.step()
+
+        running_loss += float(loss_total.item())
+        num_batches += 1
+
+        # ✅ 累加统计
+        # correct_sum_color += corr_c.detach()
+        # wrong_sum_color   += wrong_c.detach()
+
+        correct_sum_count += corr_cnt.detach()
+        wrong_sum_count   += wrong_cnt.detach()
+
+        # correct_sum_color_count += corr_pc.detach()
+        # wrong_sum_color_count   += wrong_pc.detach()
+
+    avg_loss = running_loss / max(num_batches, 1)
+
+    # ✅ 每个任务各自算 acc
+    # total_color = correct_sum_color + wrong_sum_color
+    # acc_color = correct_sum_color / torch.clamp(total_color, min=1.0)
+
+    total_count = correct_sum_count + wrong_sum_count
+    acc_count = correct_sum_count / torch.clamp(total_count, min=1.0)
+
+    # total_color_count = correct_sum_color_count + wrong_sum_color_count
+    # acc_color_count = correct_sum_color_count / torch.clamp(total_color_count, min=1.0)
+
+    return {
+        "loss": avg_loss,
+        # "acc_per_step_color": acc_color.detach().cpu(),
+        "acc_per_step_count": acc_count.detach().cpu(),
+        # "acc_per_step_color_count": acc_color_count.detach().cpu(),
     }
-    n_batches = 0
-
-    for batch in val_dl:
-        images = batch[0].to(device, non_blocking=True)
-        
-        # Posterior path (standard)
-        out_post = model(images, sample_from="posterior")
-        losses = tdvae_loss(out_post, images, beta_y=cfg.beta_y, beta_z=cfg.beta_z, recon_type=cfg.recon_type)
-        mets_post = recon_metrics_from_logits(out_post["x_logits"], images)
-
-        # Prior path (top-down only) — same decoder, just feed z_prior
-        out_prior = model(images, sample_from="prior")
-        mets_prior = recon_metrics_from_logits(out_prior["x_logits"], images)
-
-        # "rec_prior_proxy": reconstruction error using prior z (not part of ELBO by default, but useful to track)
-        if cfg.recon_type == "bce_logits":
-            rec_prior_per = F.binary_cross_entropy_with_logits(out_prior["x_logits"], images, reduction="none").flatten(1).sum(dim=1)
-        else:
-            rec_prior_per = F.mse_loss(torch.sigmoid(out_prior["x_logits"]), images, reduction="none").flatten(1).sum(dim=1)
-
-        sums["loss_post"] += float(losses["loss"].cpu())
-        sums["rec_post"] += float(losses["rec"].cpu())
-        sums["kl_y"] += float(losses["kl_y"].cpu())
-        sums["kl_z"] += float(losses["kl_z"].cpu())
-        sums["mse_post"] += float(mets_post["mse"].cpu())
-        sums["bce_post"] += float(mets_post["bce"].cpu())
-
-        sums["mse_prior"] += float(mets_prior["mse"].cpu())
-        sums["bce_prior"] += float(mets_prior["bce"].cpu())
-        sums["rec_prior_proxy"] += float(rec_prior_per.mean().cpu())
-
-        n_batches += 1
-
-    avg = {k: v / max(1, n_batches) for k, v in sums.items()}
-    return avg
-
-def save_checkpoint(
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    cfg: TrainCfg,
-    epoch: int,
-    best_metric: float,
-    path: str,
-) -> None:
-    ensure_dir(os.path.dirname(path))
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "cfg": cfg.__dict__,
-            "epoch": epoch,
-            "best_metric": best_metric,
-        },
-        path,
-    )
 
 
-def load_checkpoint(
-    model: torch.nn.Module,
-    optimizer: Optional[torch.optim.Optimizer],
-    path: str,
-    map_location: str = "cpu",
-) -> Tuple[int, float]:
-    ckpt = torch.load(path, map_location=map_location)
-    model.load_state_dict(ckpt["model"])
-    if optimizer is not None and "optimizer" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer"])
-    return int(ckpt.get("epoch", 0)), float(ckpt.get("best_metric", float("inf")))
-
-
-def fit(
-    model: torch.nn.Module,
-    train_loader: torch.utils.data.DataLoader,
-    optimizer: torch.optim.Optimizer,
-    cfg: TrainConfig,
-    val_loader: Optional[torch.utils.data.DataLoader] = None,
+@torch.no_grad()  # 验证不需要梯度
+def evaluate_one_epoch(  # 评估一个 epoch（只统计，不反传）
+    model: torch.nn.Module,  # 模型
+    dataloader,  # 验证 DataLoader
+    device: torch.device,  # 设备
+    steps: int,  # recurrent steps
+    threshold: float = 0.5,  # strict 阈值
 ) -> Dict[str, Any]:
-    device = torch.device(cfg.device)
-    model.to(device)
+    model.eval()  # 进入评估模式
 
-    best_val = float("inf")
-    ckpt_path = os.path.join(cfg.ckpt_dir, cfg.ckpt_name)
+    correct_sum = torch.zeros(steps, device=device)  # (steps,) 累加全对
+    wrong_sum = torch.zeros(steps, device=device)  # (steps,) 累加全错
 
-    history = {"train": [], "val": []}
+    for step, batch in enumerate(dataloader):
+        images, color_mh, shape_mh, count_oh, _img_fns = batch
+        x = images.to(device)  # 输入搬到 device
+        y = color_mh.to(device)  # 标签搬到 device（loss 内部会 float）
 
-    for epoch in range(1, cfg.epochs + 1):
-        train_logs = train_one_epoch(model, train_loader, optimizer, cfg, epoch)
-        history["train"].append(train_logs)
+        logits_seq = model(x, steps=steps)  # (B, steps, 8)
 
-        if val_loader is not None:
-            val_logs = evaluate(model, val_loader, cfg, split_name="val")
-            history["val"].append(val_logs)
+        # 只做 strict count，不算 loss（你现在也不需要）
+        _, correct_counts, wrong_counts = loss(  # 复用 loss 函数的统计部分
+            logits_seq=logits_seq,  # logits
+            targets=y,  # 标签
+            mode="last",  # 这里 mode 对统计没影响（只影响 loss），随便给一个
+            threshold=threshold,  # 阈值
+        )
 
-            # 以 val total 作为 best metric
-            metric = val_logs["total"]
-            if cfg.save_best and metric < best_val:
-                best_val = metric
-                save_checkpoint(model, optimizer, cfg, epoch, best_val, ckpt_path)
-                print(f"[ckpt] saved best to {ckpt_path} (val_total={best_val:.4f})")
-        else:
-            # 没有 val，就每个 epoch 保存一次（可选）
-            if not cfg.save_best:
-                save_checkpoint(model, optimizer, cfg, epoch, best_val, ckpt_path)
+        correct_sum += correct_counts.detach()  # 累加
+        wrong_sum += wrong_counts.detach()  # 累加
 
-    return {"best_val": best_val, "history": history, "ckpt_path": ckpt_path}
+    total_per_step = correct_sum + wrong_sum  # 总数
+    acc_per_step = correct_sum / torch.clamp(total_per_step, min=1.0)  # strict accuracy
+
+    return {  # 返回评估统计
+        "correct_per_step": correct_sum.detach().cpu(),
+        "wrong_per_step": wrong_sum.detach().cpu(),
+        "acc_per_step": acc_per_step.detach().cpu(),
+        "num_samples_per_step": total_per_step.detach().cpu(),
+    }
 
 
-def fit_tdvae(
-    model: torch.nn.Module,
-    train_dl: torch.utils.data.DataLoader,
-    val_dl: Optional[torch.utils.data.DataLoader],
-    optimizer: torch.optim.Optimizer,
-    cfg: TrainCfg,
-) -> Dict[str, Any]:
-    device = torch.device(cfg.device)
-    model.to(device)
-    device = torch.device(cfg.device)
-    ckpt_path = os.path.join(cfg.ckpt_dir, cfg.ckpt_name)
+def train_loop(  # 完整训练循环（多 epoch）
+    model: torch.nn.Module,  # 模型
+    train_loader,  # 训练 DataLoader
+    device: torch.device,  # 设备
+    steps: int,  # recurrent steps
+    epochs: int = 20,  # epoch 数
+    lr: float = 1e-3,  # 学习率
+    loss_mode: str = "last",  # 损失模式
+    threshold: float = 0.5,  # strict 阈值
+    step_weights: Optional[torch.Tensor] = None,  # weighted 模式用
+    aux_weight: float = 0.1,  # last+aux 用
+    pos_weight: Optional[torch.Tensor] = None,  # 类别不均衡
+    grad_clip_norm: Optional[float] = 1.0,  # 梯度裁剪
+    val_loader=None,  # 验证 DataLoader（可选）
+):
+    model = model.to(device)  # 模型搬到 device
 
-    history = {"train": [], "val": []}
-    best_metric = float("inf")
-    for epoch in range(1, cfg.epochs + 1):
-        train_logs = train_one_epoch(model, train_dl, optimizer, cfg)
-        history["train"].append(train_logs)
-        if best_metric > train_logs["loss"]:
-            best_metric = train_logs["loss"]
-            save_checkpoint(model, optimizer, cfg, epoch, best_metric, ckpt_path)
-        if val_dl is not None:
-            val_logs = evaluate(model, val_dl, device, cfg)
-            print(
-                f"[val]   loss_post {val_logs['loss_post']:.4f} rec_post {val_logs['rec_post']:.4f} "
-                f"kl_y {val_logs['kl_y']:.4f} kl_z {val_logs['kl_z']:.4f} | "
-                f"mse_post {val_logs['mse_post']:.6f} mse_prior {val_logs['mse_prior']:.6f} | "
-                f"bce_post {val_logs['bce_post']:.6f} bce_prior {val_logs['bce_prior']:.6f}"
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)  # Adam 优化器
+
+    history = {  # 用 dict 存训练过程（后面画图用）
+        "train_loss": [],  # 每 epoch 平均 loss
+        "train_acc_per_step": [],  # 每 epoch 每步 accuracy
+        "val_acc_per_step": [],  # 每 epoch 每步 val accuracy（可选）
+    }
+
+    for epoch in range(1, epochs + 1):  # 遍历 epoch
+        train_stats = train_one_epoch(  # 训练一个 epoch
+            model=model,  # 模型
+            dataloader=train_loader,  # train loader
+            optimizer=optimizer,  # 优化器
+            device=device,  # device
+            steps=steps,  # steps
+            loss_mode=loss_mode,  # loss 模式
+            threshold=threshold,  # 阈值
+            step_weights=step_weights,  # step 权重（可选）
+            aux_weight=aux_weight,  # aux 权重
+            pos_weight=pos_weight,  # pos_weight（可选）
+            grad_clip_norm=grad_clip_norm,  # 裁剪
+        )
+
+        history["train_loss"].append(train_stats["loss"])  # 记录 loss
+        history["train_acc_per_step"].append(train_stats["acc_per_step_count"])  # 记录每步 acc
+
+        # 打印训练摘要：只打印最后一步的 acc（你也可以打印整条曲线）
+        last_acc = float(train_stats["acc_per_step_count"][-1])  # 取最后一步 accuracy
+        print(f"Epoch {epoch:03d} | loss={train_stats['loss']:.4f} | train_acc(t=end)={last_acc:.4f}")  # 打印
+
+        if val_loader is not None:  # 如果有验证集
+            val_stats = evaluate_one_epoch(  # 评估
+                model=model,  # 模型
+                dataloader=val_loader,  # val loader
+                device=device,  # device
+                steps=steps,  # steps
+                threshold=threshold,  # 阈值
             )
-            history["val"].append(val_logs)
+            history["val_acc_per_step"].append(val_stats["acc_per_step"])  # 记录验证 acc
+            val_last_acc = float(val_stats["acc_per_step"][-1])  # 最后一步 val acc
+            print(f"         | val_acc(t=end)={val_last_acc:.4f}")  # 打印验证摘要
 
-    return history
+            # acc = val_stats["acc_per_step"]  # (steps,)
+            # for t, a in enumerate(acc.tolist(), start=1):
+            #     print(f"val step {t}: acc={a:.4f}")
+    return history  # 返回历史记录（之后做可视化）

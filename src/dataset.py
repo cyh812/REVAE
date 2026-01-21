@@ -55,10 +55,12 @@ def build_global_vocab_and_maxcount(clevr_root: str, splits=("train","val","test
 
 class CLEVRMultiLabelByImage(Dataset):
     """
-    One sample = one image with 3 labels:
+    One sample = one image with labels:
       - color_multi_hot: [num_colors]
       - shape_multi_hot: [num_shapes]
       - count_one_hot:  [max_objects+1]  (index = number of objects)
+      - color_count:    [num_colors, max_objects+1] (each row one-hot count 0..max)
+      - shape_count:    [num_shapes, max_objects+1]
     """
     def __init__(
         self,
@@ -96,19 +98,21 @@ class CLEVRMultiLabelByImage(Dataset):
     def __getitem__(self, idx):
         scene = self.scenes[idx]
 
-        # --- image filename ---
+        # --- image filename/path ---
         img_fn = scene.get("image_filename", None)
         if img_fn is None:
-            # fallback if absent
             img_fn = f"CLEVR_{self.split}_{scene['image_index']:06d}.png"
         img_path = os.path.join(self.img_dir, img_fn)
 
         img = Image.open(img_path).convert("RGB")
         img = self.transform(img)
 
-        # --- build labels ---
-        color_mh = torch.zeros(len(self.colors), dtype=torch.float32)
-        shape_mh = torch.zeros(len(self.shapes), dtype=torch.float32)
+        # --- basic labels ---
+        num_colors = len(self.colors)
+        num_shapes = len(self.shapes)
+
+        color_mh = torch.zeros(num_colors, dtype=torch.float32)
+        shape_mh = torch.zeros(num_shapes, dtype=torch.float32)
 
         num_objs = len(scene["objects"])
         if num_objs > self.max_objects:
@@ -118,11 +122,30 @@ class CLEVRMultiLabelByImage(Dataset):
         count_oh = torch.zeros(self.max_objects + 1, dtype=torch.float32)
         count_oh[num_objs] = 1.0
 
+        # --- NEW: per-color / per-shape counts (integer counters first) ---
+        color_cnt_int = torch.zeros(num_colors, dtype=torch.long)  # 每个颜色出现次数
+        shape_cnt_int = torch.zeros(num_shapes, dtype=torch.long)  # 每个形状出现次数
+
         for obj in scene["objects"]:
             c = obj["color"]
             s = obj["shape"]
-            # set multi-hot
-            color_mh[self.color_to_idx[c]] = 1.0
-            shape_mh[self.shape_to_idx[s]] = 1.0
 
-        return img, color_mh, shape_mh, count_oh, img_fn
+            ci = self.color_to_idx[c]
+            si = self.shape_to_idx[s]
+
+            color_mh[ci] = 1.0
+            shape_mh[si] = 1.0
+
+            color_cnt_int[ci] += 1
+            shape_cnt_int[si] += 1
+
+        # --- convert integer counts to one-hot rows (num_x, max+1) ---
+        color_count = torch.zeros(num_colors, self.max_objects + 1, dtype=torch.float32)
+        shape_count = torch.zeros(num_shapes, self.max_objects + 1, dtype=torch.float32)
+
+        # 每行 one-hot：index = count
+        color_count[torch.arange(num_colors), color_cnt_int.clamp_(0, self.max_objects)] = 1.0
+        shape_count[torch.arange(num_shapes), shape_cnt_int.clamp_(0, self.max_objects)] = 1.0
+
+        # ✅ 按你的要求：去掉 img_fn，新增两个绑定标签
+        return img, color_mh, shape_mh, count_oh, color_count, shape_count
