@@ -138,18 +138,17 @@ class TwoLayerConvGRUNet(nn.Module):  # 整体模型：stem + 两层 ConvGRU + h
 
             pooled = F.adaptive_avg_pool2d(h2, output_size=1)  # GAP -> (B, 128, 1, 1)
             pooled = pooled.view(B, -1)  # 展平 -> (B, 128)
-            # logits_color = self.head_color(pooled)  # 当前步 logits -> (B, 8)
+            logits_color = self.head_color(pooled)  # 当前步 logits -> (B, 8)
             logits_count = self.head_count(pooled)
-            # logits_per_color = self.head_per_color(pooled)
-            # logits_per_color = logits_per_color.view(B, 8, 11) 
+            logits_per_color = self.head_per_color(pooled)
+            logits_per_color = logits_per_color.view(B, 8, 11) 
 
-            # logits_colors.append(logits_color)
+            logits_colors.append(logits_color)
             logits_counts.append(logits_count)
-            # logits_per_colors.append(logits_per_color)
+            logits_per_colors.append(logits_per_color)
 
-        # logits_colors = torch.stack(logits_colors, dim=1)  # 堆叠 -> (B, steps, 8)
+        logits_colors = torch.stack(logits_colors, dim=1)  # 堆叠 -> (B, steps, 8)
         logits_counts = torch.stack(logits_counts, dim=1)  # 堆叠 -> (B, steps, 11)
-        # logits_per_colors = torch.stack(logits_per_colors, dim=1)  # 堆叠 -> (B, steps, 8, 11)            
+        logits_per_colors = torch.stack(logits_per_colors, dim=1)  # 堆叠 -> (B, steps, 8, 11)            
 
-        # return logits_colors, logits_counts, logits_per_colors  # 返回每一步 logits
-        return logits_counts # 返回每一步 logits
+        return logits_colors, logits_counts, logits_per_colors  # 返回每一步 logits

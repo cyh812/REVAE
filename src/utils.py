@@ -78,3 +78,68 @@ def plot_history_epoch_curves(history: dict):
         plt.title("Val Strict Accuracy vs Epoch (one line per step)")  # 标题
         plt.legend()  # 图例
         plt.show()  # 显示
+
+
+def plot(history: dict):
+    # ========= 1) Loss vs Epoch =========
+    train_loss = history.get("train_loss", None)
+    if train_loss is not None and len(train_loss) > 0:
+        epochs = list(range(1, len(train_loss) + 1))
+
+        plt.figure()
+        plt.plot(epochs, train_loss)
+        plt.xlabel("epoch")
+        plt.ylabel("loss")
+        plt.title("Train Loss vs Epoch")
+        plt.show()
+
+    # ========= helper: list[tensor] -> (E, steps) numpy =========
+    def _stack_acc(acc_list):
+        if acc_list is None or len(acc_list) == 0:
+            return None
+        mat = []
+        for v in acc_list:
+            if hasattr(v, "detach"):
+                v = v.detach().cpu().numpy()
+            mat.append(v)
+        return mat  # list of np arrays, each shape=(steps,)
+
+    acc_color_list = history.get("train_acc_per_step_color", None)
+    acc_count_list = history.get("train_acc_per_step_count", None)
+    acc_color_count_list = history.get("train_acc_per_step_color_count", None)
+
+    acc_color = _stack_acc(acc_color_list)
+    acc_count = _stack_acc(acc_count_list)
+    acc_color_count = _stack_acc(acc_color_count_list)
+
+    # 如果三个都没有就直接返回
+    if acc_color is None and acc_count is None and acc_color_count is None:
+        return
+
+    # 统一 epoch 轴长度：以第一个非空为准
+    first = acc_color or acc_count or acc_color_count
+    E = len(first)
+    epochs = list(range(1, E + 1))
+    steps = len(first[0])
+
+    # ========= 2) 1×3 子图：三个 head 的 Acc =========
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))  # 1 行 3 列
+
+    def _plot_one(ax, acc_mat, title):
+        ax.set_title(title)
+        ax.set_xlabel("epoch")
+        ax.set_ylabel("strict accuracy")
+        if acc_mat is None:
+            ax.text(0.5, 0.5, "No data", ha="center", va="center")
+            return
+        for t in range(steps):
+            y = [acc_mat[e][t] for e in range(E)]
+            ax.plot(epochs, y, label=f"step={t+1}")
+        ax.legend()
+
+    _plot_one(axes[0], acc_color, "Color Presence (Train) - Strict Acc")
+    _plot_one(axes[1], acc_count, "Total Count (Train) - Strict Acc")
+    _plot_one(axes[2], acc_color_count, "Per-Color Count (Train) - Strict Acc")
+
+    plt.tight_layout()
+    plt.show()

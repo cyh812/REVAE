@@ -240,23 +240,23 @@ def train_one_epoch(
         images, color_mh, shape_mh, count_oh, color_count, shape_count = batch
 
         images      = images.to(device)
-        # color_mh    = color_mh.to(device)
+        color_mh    = color_mh.to(device)
         count_oh    = count_oh.to(device)
-        # color_count = color_count.to(device)
+        color_count = color_count.to(device)
 
         # ✅ model 应该返回 3 个 logits 序列
-        logits_counts = model(images, steps=steps)
+        logits_colors, logits_counts, logits_color_count = model(images, steps=steps)
 
         # ===== loss 1: color presence (BCE) =====
-        # lc, corr_c, wrong_c = loss_color(
-        #     logits_seq=logits_colors,      # (B,S,8)
-        #     targets=color_mh,              # (B,8)
-        #     mode=loss_mode,
-        #     threshold=threshold,
-        #     step_weights=step_weights,
-        #     aux_weight=aux_weight,
-        #     pos_weight=pos_weight,         # ✅ 只有这里需要
-        # )
+        lc, corr_c, wrong_c = loss_color(
+            logits_seq=logits_colors,      # (B,S,8)
+            targets=color_mh,              # (B,8)
+            mode=loss_mode,
+            threshold=threshold,
+            step_weights=step_weights,
+            aux_weight=aux_weight,
+            pos_weight=pos_weight,         # ✅ 只有这里需要
+        )
 
         # ===== loss 2: total count (CE) =====
         lcnt, corr_cnt, wrong_cnt = loss_count(
@@ -269,17 +269,16 @@ def train_one_epoch(
 
         # ===== loss 3: per-color count (CE) =====
         # 注意：我之前函数名叫 loss_per_color_count，targets_oh shape=(B,8,11)
-        # lpc, corr_pc, wrong_pc, _micro = loss_per_color_count(
-        #     logits_seq=logits_color_count, # (B,S,8,11)
-        #     targets_oh=color_count,        # (B,8,11)
-        #     mode=loss_mode,
-        #     step_weights=step_weights,
-        #     aux_weight=aux_weight,
-        #     return_micro=False,            # 先不统计 micro 也行
-        # )
+        lpc, corr_pc, wrong_pc, _micro = loss_per_color_count(
+            logits_seq=logits_color_count, # (B,S,8,11)
+            targets_oh=color_count,        # (B,8,11)
+            mode=loss_mode,
+            step_weights=step_weights,
+            aux_weight=aux_weight,
+            return_micro=False,            # 先不统计 micro 也行
+        )
 
-        # loss_total = lc + lcnt + lpc
-        loss_total = lcnt
+        loss_total = 0.25*lc + 0.25*lcnt + 0.5*lpc
 
         optimizer.zero_grad()
         loss_total.backward()
@@ -293,32 +292,32 @@ def train_one_epoch(
         num_batches += 1
 
         # ✅ 累加统计
-        # correct_sum_color += corr_c.detach()
-        # wrong_sum_color   += wrong_c.detach()
+        correct_sum_color += corr_c.detach()
+        wrong_sum_color   += wrong_c.detach()
 
         correct_sum_count += corr_cnt.detach()
         wrong_sum_count   += wrong_cnt.detach()
 
-        # correct_sum_color_count += corr_pc.detach()
-        # wrong_sum_color_count   += wrong_pc.detach()
+        correct_sum_color_count += corr_pc.detach()
+        wrong_sum_color_count   += wrong_pc.detach()
 
     avg_loss = running_loss / max(num_batches, 1)
 
     # ✅ 每个任务各自算 acc
-    # total_color = correct_sum_color + wrong_sum_color
-    # acc_color = correct_sum_color / torch.clamp(total_color, min=1.0)
+    total_color = correct_sum_color + wrong_sum_color
+    acc_color = correct_sum_color / torch.clamp(total_color, min=1.0)
 
     total_count = correct_sum_count + wrong_sum_count
     acc_count = correct_sum_count / torch.clamp(total_count, min=1.0)
 
-    # total_color_count = correct_sum_color_count + wrong_sum_color_count
-    # acc_color_count = correct_sum_color_count / torch.clamp(total_color_count, min=1.0)
+    total_color_count = correct_sum_color_count + wrong_sum_color_count
+    acc_color_count = correct_sum_color_count / torch.clamp(total_color_count, min=1.0)
 
     return {
         "loss": avg_loss,
-        # "acc_per_step_color": acc_color.detach().cpu(),
+        "acc_per_step_color": acc_color.detach().cpu(),
         "acc_per_step_count": acc_count.detach().cpu(),
-        # "acc_per_step_color_count": acc_color_count.detach().cpu(),
+        "acc_per_step_color_count": acc_color_count.detach().cpu(),
     }
 
 
@@ -385,7 +384,9 @@ def train_loop(  # 完整训练循环（多 epoch）
 
     history = {  # 用 dict 存训练过程（后面画图用）
         "train_loss": [],  # 每 epoch 平均 loss
-        "train_acc_per_step": [],  # 每 epoch 每步 accuracy
+        "train_acc_per_step_color": [],  # 每 epoch 每步 accuracy
+        "train_acc_per_step_count": [],
+        "train_acc_per_step_color_count": [],
         "val_acc_per_step": [],  # 每 epoch 每步 val accuracy（可选）
     }
 
@@ -405,11 +406,18 @@ def train_loop(  # 完整训练循环（多 epoch）
         )
 
         history["train_loss"].append(train_stats["loss"])  # 记录 loss
-        history["train_acc_per_step"].append(train_stats["acc_per_step_count"])  # 记录每步 acc
+        history["train_acc_per_step_color"].append(train_stats["acc_per_step_color"])  # 记录每步 acc
+        history["train_acc_per_step_count"].append(train_stats["acc_per_step_count"])  # 记录每步 acc
+        history["train_acc_per_step_color_count"].append(train_stats["acc_per_step_color_count"])  # 记录每步 acc
+
 
         # 打印训练摘要：只打印最后一步的 acc（你也可以打印整条曲线）
-        last_acc = float(train_stats["acc_per_step_count"][-1])  # 取最后一步 accuracy
-        print(f"Epoch {epoch:03d} | loss={train_stats['loss']:.4f} | train_acc(t=end)={last_acc:.4f}")  # 打印
+        color_acc = float(train_stats["acc_per_step_color"][-1])  # 取最后一步 accuracy
+        count_acc = float(train_stats["acc_per_step_count"][-1])
+        color_count_acc = float(train_stats["acc_per_step_color_count"][-1])
+        print(
+            f"Epoch {epoch:03d} | color_acc = {color_acc:.4f} count_acc = {count_acc:.4f} color_count = {color_count_acc:.4f} "
+            )  # 打印
 
         if val_loader is not None:  # 如果有验证集
             val_stats = evaluate_one_epoch(  # 评估
@@ -423,7 +431,4 @@ def train_loop(  # 完整训练循环（多 epoch）
             val_last_acc = float(val_stats["acc_per_step"][-1])  # 最后一步 val acc
             print(f"         | val_acc(t=end)={val_last_acc:.4f}")  # 打印验证摘要
 
-            # acc = val_stats["acc_per_step"]  # (steps,)
-            # for t, a in enumerate(acc.tolist(), start=1):
-            #     print(f"val step {t}: acc={a:.4f}")
     return history  # 返回历史记录（之后做可视化）
