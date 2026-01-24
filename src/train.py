@@ -1,7 +1,7 @@
 
 import torch  # 导入 PyTorch
 import torch.nn as nn  # 导入 nn 模块
-
+import os
 from typing import Optional, Dict, Any  # 类型标注（可选）
 
 def loss_color(  # 一个函数：loss + 每步严格对齐的对/错 count
@@ -367,6 +367,10 @@ def train_loop(  # 完整训练循环（多 epoch）
     model: torch.nn.Module,  # 模型
     train_loader,  # 训练 DataLoader
     device: torch.device,  # 设备
+    ckpt_dir: str,
+    ckpt_name: str,
+    colors: list,
+    shapes: list,
     steps: int,  # recurrent steps
     epochs: int = 20,  # epoch 数
     lr: float = 1e-3,  # 学习率
@@ -379,8 +383,8 @@ def train_loop(  # 完整训练循环（多 epoch）
     val_loader=None,  # 验证 DataLoader（可选）
 ):
     model = model.to(device)  # 模型搬到 device
-
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)  # Adam 优化器
+    save_path = os.path.join(ckpt_dir, ckpt_name)
 
     history = {  # 用 dict 存训练过程（后面画图用）
         "train_loss": [],  # 每 epoch 平均 loss
@@ -431,4 +435,34 @@ def train_loop(  # 完整训练循环（多 epoch）
             val_last_acc = float(val_stats["acc_per_step"][-1])  # 最后一步 val acc
             print(f"         | val_acc(t=end)={val_last_acc:.4f}")  # 打印验证摘要
 
+    cfg = {
+        "colors": colors,
+        "shapes": shapes,
+        "threshold": threshold,
+        "lr": lr
+    }
+    save_checkpoint(model,optimizer,cfg, epochs, train_stats["loss"], save_path)
     return history  # 返回历史记录（之后做可视化）
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+def save_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    cfg,
+    epoch: int,
+    best_metric: float,
+    path: str,
+    ) -> None:
+    ensure_dir(os.path.dirname(path))
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "cfg": cfg,
+            "epoch": epoch,
+            "best_metric": best_metric,
+        },
+        path,
+    )

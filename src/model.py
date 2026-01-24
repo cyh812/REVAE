@@ -50,7 +50,8 @@ class ConvStem(nn.Module):  # 普通卷积前端（类似 ResNet stem 的简化�
             padding=3,  # padding 保尺寸合理
             bias=False  # 配合 BN 通常不需要 bias
         )
-        self.bn1 = nn.BatchNorm2d(base_channels)  # BN
+        
+        self.bn1 = nn.GroupNorm(num_groups=32, num_channels=base_channels)
         self.relu = nn.ReLU(inplace=True)  # ReLU 激活
         self.pool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)  # 再下采样到 56x56
 
@@ -62,7 +63,7 @@ class ConvStem(nn.Module):  # 普通卷积前端（类似 ResNet stem 的简化�
             padding=1,  # same padding
             bias=False  # 不要 bias
         )
-        self.bn2 = nn.BatchNorm2d(base_channels)  # BN
+        self.bn2 = nn.GroupNorm(num_groups=32, num_channels=base_channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # 前向
         x = self.conv1(x)  # 7x7 卷积 + stride2
@@ -89,7 +90,7 @@ class TwoLayerConvGRUNet(nn.Module):  # 整体模型：stem + 两层 ConvGRU + h
             padding=0,  # 无 padding
             bias=False  # 不用 bias
         )
-        self.bn_pre1 = nn.BatchNorm2d(h1_channels)  # BN
+        self.bn_pre1 = nn.GroupNorm(num_groups=32, num_channels=h1_channels)
         self.rnn1 = ConvGRUCell(in_channels=h1_channels, hidden_channels=h1_channels, kernel_size=3)  # 第一层 ConvGRU（56x56）
 
         self.down12 = nn.Conv2d(  # 从 56x56 下采样到 28x28，并变换通道到 h2_channels
@@ -100,7 +101,7 @@ class TwoLayerConvGRUNet(nn.Module):  # 整体模型：stem + 两层 ConvGRU + h
             padding=1,  # same padding
             bias=False  # 不用 bias
         )
-        self.bn_down12 = nn.BatchNorm2d(h2_channels)  # BN
+        self.bn_down12 = nn.GroupNorm(num_groups=32, num_channels=h2_channels)
         self.rnn2 = ConvGRUCell(in_channels=h2_channels, hidden_channels=h2_channels, kernel_size=3)  # 第二层 ConvGRU（28x28）
 
         self.head_color = nn.Linear(h2_channels, num_classes)

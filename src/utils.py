@@ -1,4 +1,7 @@
 import matplotlib.pyplot as plt  # 导入 matplotlib
+import torch
+from typing import Dict, Optional, Tuple, Any
+
 
 def plot_history_epoch_curves(history: dict):
     """
@@ -143,3 +146,15 @@ def plot(history: dict):
 
     plt.tight_layout()
     plt.show()
+
+def load_checkpoint(
+    model: torch.nn.Module,
+    optimizer: Optional[torch.optim.Optimizer],
+    path: str,
+    map_location: str = "cpu",
+    ) -> Tuple[int, float]:
+    ckpt = torch.load(path, map_location=map_location)
+    model.load_state_dict(ckpt["model"])
+    if optimizer is not None and "optimizer" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer"])
+    return model
