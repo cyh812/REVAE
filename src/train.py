@@ -4,16 +4,16 @@ import torch.nn as nn  # 导入 nn 模块
 import os
 from typing import Optional, Dict, Any  # 类型标注（可选）
 
-def loss_color(  # 一个函数：loss + 每步严格对齐的对/错 count
-    logits_seq: torch.Tensor,            # (B, Step, 8) 每一步 logits
-    targets: torch.Tensor,               # (B, 8) multi-hot 标签（0/1）
+def loss_main(  # 一个函数：loss + 每步严格对齐的对/错 count（适用于 color=8 或 shape=3）
+    logits_seq: torch.Tensor,            # (B, Step, C) 每一步 logits（C=8 表示颜色；C=3 表示形状）
+    targets: torch.Tensor,               # (B, C) multi-hot 标签（0/1）
     mode: str = "last",                  # "last" | "all" | "weighted" | "last+aux"
     threshold: float = 0.5,              # sigmoid 后阈值化
     step_weights: torch.Tensor = None,   # (Step,) weighted 模式可选
     aux_weight: float = 0.1,             # last+aux 模式可选
-    pos_weight: torch.Tensor = None,     # (8,) BCE pos_weight 可选
+    pos_weight: torch.Tensor = None,     # (C,) BCE pos_weight 可选（注意：形状时应为 (3,), 颜色时为 (8,)）
 ):
-    B, S, C = logits_seq.shape  # 解析维度
+    B, S, C = logits_seq.shape  # 解析维度（B=batch, S=steps, C=类别数）
     targets = targets.float()  # BCEWithLogitsLoss 需要 float 标签
 
     # ---------- 1) 计算 loss（可切换） ----------
@@ -24,25 +24,31 @@ def loss_color(  # 一个函数：loss + 每步严格对齐的对/错 count
 
     if mode == "last":  # 只监督最后一步
         loss = loss_fn(logits_seq[:, -1, :], targets)  # last-step loss
+
     elif mode == "all":  # 每一步都监督，取平均
         losses = []  # 存每步 loss
         for t in range(S):  # 遍历 step
             losses.append(loss_fn(logits_seq[:, t, :], targets))  # 计算当前步 loss
         loss = torch.stack(losses, dim=0).mean()  # 平均成标量
+
     elif mode == "weighted":  # 每一步监督，按权重加权
         losses = []  # 存每步 loss
         for t in range(S):  # 遍历 step
             losses.append(loss_fn(logits_seq[:, t, :], targets))  # 当前步 loss
         losses = torch.stack(losses, dim=0)  # (S,) 每步一个 loss
+
         if step_weights is None:  # 如果没给权重
             step_weights = torch.linspace(1.0, 2.0, steps=S, device=logits_seq.device)  # 默认后期更重
         else:
             step_weights = step_weights.to(logits_seq.device)  # 搬到 device
             assert step_weights.shape == (S,), f"step_weights 必须是 (Step,)={S}"  # 检查形状
+
         step_weights = step_weights / step_weights.sum()  # 归一化
         loss = (losses * step_weights).sum()  # 加权求和
+
     elif mode == "last+aux":  # 最后一步主导 + 早期步辅助
         main_loss = loss_fn(logits_seq[:, -1, :], targets)  # 主损失：最后一步
+
         if S == 1:  # 只有一步就直接返回
             loss = main_loss  # 退化为 last
         else:
@@ -51,24 +57,25 @@ def loss_color(  # 一个函数：loss + 每步严格对齐的对/错 count
                 aux_losses.append(loss_fn(logits_seq[:, t, :], targets))  # 早期步 loss
             aux_loss = torch.stack(aux_losses, dim=0).mean()  # 早期步平均
             loss = main_loss + aux_weight * aux_loss  # 合成总 loss
+
     else:
         raise ValueError("mode 必须是 'last' | 'all' | 'weighted' | 'last+aux'")  # 报错
 
     # ---------- 2) 计算每一步 strict correct/wrong counts ----------
     with torch.no_grad():  # 统计不需要梯度
-        probs = torch.sigmoid(logits_seq)  # (B, S, 8) 转概率（仅用于阈值化）
-        preds = (probs >= threshold).float()  # (B, S, 8) 阈值化得到 0/1
+        probs = torch.sigmoid(logits_seq)  # (B, S, C) 转概率（仅用于阈值化）
+        preds = (probs >= threshold).float()  # (B, S, C) 阈值化得到 0/1
 
         correct_counts = torch.zeros(S, device=logits_seq.device)  # (S,) 每步全对数量
         wrong_counts = torch.zeros(S, device=logits_seq.device)  # (S,) 每步非全对数量
 
         for t in range(S):  # 遍历每一步
-            eq = (preds[:, t, :] == targets)  # (B, 8) 每一位是否正确
-            all_ok = eq.all(dim=1)  # (B,) 每张图是否 8 位全对
+            eq = (preds[:, t, :] == targets)  # (B, C) 每一位是否正确
+            all_ok = eq.all(dim=1)  # (B,) 每张图是否 C 位全对（严格：全对才算对）
             n_ok = all_ok.sum()  # 全对数量
             correct_counts[t] = n_ok  # 记录 correct
             wrong_counts[t] = B - n_ok  # 记录 wrong
- 
+
     return loss, correct_counts, wrong_counts  # 返回：loss + 每步 n_correct/n_wrong（用于 epoch 累加）
 
 def loss_count(  # one-hot count 的 loss + 每步对/错统计
@@ -133,80 +140,84 @@ def loss_count(  # one-hot count 的 loss + 每步对/错统计
 
     return loss, correct_counts, wrong_counts
 
-def loss_per_color_count(
-    logits_seq: torch.Tensor,            # (B, Step, 8, 11)
-    targets_oh: torch.Tensor,            # (B, 8, 11)
+
+def loss_bind(  # 一个函数：loss + 每步严格对齐的对/错 count（用于 颜色-数量绑定 或 形状-数量绑定）
+    logits_seq: torch.Tensor,            # (B, Step, K, 11)  K=8(颜色) 或 K=3(形状)
+    targets_oh: torch.Tensor,            # (B, K, 11) one-hot（每个颜色/形状对应一个数量类别 0..10）
     mode: str = "last",                  # "last" | "all" | "weighted" | "last+aux"
     step_weights: Optional[torch.Tensor] = None,  # (Step,)
     aux_weight: float = 0.1,             # last+aux
-    return_micro: bool = False,           # 是否额外返回 micro acc（按颜色位点） 按颜色粒度统计（总共 B*8 个颜色位点，预测对多少）
+    return_micro: bool = False,          # 是否额外返回 micro acc（按颜色/形状位点统计：总共 B*K 个位点）
 ):
-    B, S, K8, K11 = logits_seq.shape  # B=batch, S=step, K8=8 colors, K11=11 classes
-    assert targets_oh.shape == (B, K8, K11), f"targets_oh 应为 (B,8,11)，但得到 {targets_oh.shape}"
+    B, S, K, K11 = logits_seq.shape  # B=batch, S=step, K=颜色/形状数, K11=11(数量类别数)
+    assert K11 == 11, f"最后一维必须是 11（数量 0..10），但得到 {K11}"
+    assert targets_oh.shape == (B, K, K11), f"targets_oh 应为 (B,{K},11)，但得到 {targets_oh.shape}"
 
-    # --- one-hot -> class index: (B, 8) ---
-    targets_idx = targets_oh.argmax(dim=2).long()  # 每个颜色的数量类别 0..10
+    # --- one-hot -> class index: (B, K) ---
+    targets_idx = targets_oh.argmax(dim=2).long()  # 每个颜色/形状的数量类别 0..10
 
     # ---------- 1) loss（可切换） ----------
     # CE 输入：(N, C) logits + (N,) target_index
     loss_fn = nn.CrossEntropyLoss(reduction="mean")
 
     def step_ce(t: int) -> torch.Tensor:
-        # logits_t: (B, 8, 11) -> reshape 为 (B*8, 11)
-        logits_t = logits_seq[:, t, :, :].reshape(B * K8, K11)
-        targets_t = targets_idx.reshape(B * K8)
+        # logits_t: (B, K, 11) -> reshape 为 (B*K, 11)
+        logits_t = logits_seq[:, t, :, :].reshape(B * K, K11)
+        targets_t = targets_idx.reshape(B * K)
         return loss_fn(logits_t, targets_t)
 
-    if mode == "last":
+    if mode == "last":  # 只监督最后一步
         loss = step_ce(S - 1)
-    elif mode == "all":
+    elif mode == "all":  # 每一步都监督，取平均
         losses = [step_ce(t) for t in range(S)]
         loss = torch.stack(losses, dim=0).mean()
-    elif mode == "weighted":
+    elif mode == "weighted":  # 每一步监督，按权重加权
         losses = [step_ce(t) for t in range(S)]
         losses = torch.stack(losses, dim=0)  # (S,)
-        if step_weights is None:
-            step_weights = torch.linspace(1.0, 2.0, steps=S, device=logits_seq.device)
+        if step_weights is None:  # 如果没给权重
+            step_weights = torch.linspace(1.0, 2.0, steps=S, device=logits_seq.device)  # 默认后期更重
         else:
-            step_weights = step_weights.to(logits_seq.device)
+            step_weights = step_weights.to(logits_seq.device)  # 搬到 device
             assert step_weights.shape == (S,), f"step_weights 必须是 (Step,)={S}"
-        step_weights = step_weights / step_weights.sum()
-        loss = (losses * step_weights).sum()
-    elif mode == "last+aux":
-        main_loss = step_ce(S - 1)
-        if S == 1:
-            loss = main_loss
+        step_weights = step_weights / step_weights.sum()  # 归一化
+        loss = (losses * step_weights).sum()  # 加权求和
+    elif mode == "last+aux":  # 最后一步主导 + 早期步辅助
+        main_loss = step_ce(S - 1)  # 主损失：最后一步
+        if S == 1:  # 只有一步就直接返回
+            loss = main_loss  # 退化为 last
         else:
-            aux_losses = [step_ce(t) for t in range(S - 1)]
-            aux_loss = torch.stack(aux_losses, dim=0).mean()
-            loss = main_loss + aux_weight * aux_loss
+            aux_losses = [step_ce(t) for t in range(S - 1)]  # 早期步 loss
+            aux_loss = torch.stack(aux_losses, dim=0).mean()  # 早期步平均
+            loss = main_loss + aux_weight * aux_loss  # 合成总 loss
     else:
-        raise ValueError("mode 必须是 'last' | 'all' | 'weighted' | 'last+aux'")
+        raise ValueError("mode 必须是 'last' | 'all' | 'weighted' | 'last+aux'")  # 报错
 
     # ---------- 2) 统计每一步 strict correct/wrong（按 batch 图片为单位） ----------
-    with torch.no_grad():
-        # pred_idx: (B, S, 8)
-        pred_idx = logits_seq.argmax(dim=3)  # 对 11 类取 argmax
-        correct_counts = torch.zeros(S, device=logits_seq.device)
-        wrong_counts = torch.zeros(S, device=logits_seq.device)
+    with torch.no_grad():  # 统计不需要梯度
+        # pred_idx: (B, S, K)  对 11 类取 argmax
+        pred_idx = logits_seq.argmax(dim=3)
 
-        micro_acc = torch.zeros(S, device=logits_seq.device) if return_micro else None
+        correct_counts = torch.zeros(S, device=logits_seq.device)  # (S,) 每步 strict 全对数量
+        wrong_counts = torch.zeros(S, device=logits_seq.device)    # (S,) 每步 strict 非全对数量
 
-        for t in range(S):
-            # per_color_ok: (B, 8)
-            per_color_ok = (pred_idx[:, t, :] == targets_idx)
+        micro_acc = torch.zeros(S, device=logits_seq.device) if return_micro else None  # (S,) micro acc（可选）
 
-            # strict：一张图 8 个颜色全对才算对 -> (B,)
-            all_ok = per_color_ok.all(dim=1)
+        for t in range(S):  # 遍历每一步
+            # per_slot_ok: (B, K)  每个颜色/形状位点是否预测正确
+            per_slot_ok = (pred_idx[:, t, :] == targets_idx)
+
+            # strict：一张图 K 个位点全对才算对 -> (B,)
+            all_ok = per_slot_ok.all(dim=1)
             n_ok = all_ok.sum()
             correct_counts[t] = n_ok
             wrong_counts[t] = B - n_ok
 
-            # micro：按颜色位点统计正确率（B*8 个位置）
+            # micro：按位点统计正确率（B*K 个位置）
             if return_micro:
-                micro_acc[t] = per_color_ok.float().mean()
+                micro_acc[t] = per_slot_ok.float().mean()
 
-    return loss, correct_counts, wrong_counts, (micro_acc.detach().cpu() if return_micro else None)
+    return loss, correct_counts, wrong_counts, (micro_acc.detach().cpu() if return_micro else None)  # 返回：loss + strict 统计 + micro（可选）
+
 
 def train_one_epoch(
     model: torch.nn.Module,
@@ -220,6 +231,7 @@ def train_one_epoch(
     aux_weight: float = 0.1,
     pos_weight: Optional[torch.Tensor] = None,   # 只给 BCE 的 color presence 用
     grad_clip_norm: Optional[float] = 1.0,
+    kind: str = "color",
 ) -> Dict[str, Any]:
     model.train()
 
@@ -240,15 +252,18 @@ def train_one_epoch(
         images, color_mh, shape_mh, count_oh, color_count, shape_count = batch
 
         images      = images.to(device)
-        color_mh    = color_mh.to(device)
         count_oh    = count_oh.to(device)
-        color_count = color_count.to(device)
-
+        if kind == "color":
+            color_mh    = color_mh.to(device)
+            color_count = color_count.to(device)
+        else:
+            color_mh    = shape_mh.to(device)
+            color_count = shape_count.to(device)
         # ✅ model 应该返回 3 个 logits 序列
         logits_colors, logits_counts, logits_color_count = model(images, steps=steps)
 
         # ===== loss 1: color presence (BCE) =====
-        lc, corr_c, wrong_c = loss_color(
+        lc, corr_c, wrong_c = loss_main(
             logits_seq=logits_colors,      # (B,S,8)
             targets=color_mh,              # (B,8)
             mode=loss_mode,
@@ -269,7 +284,7 @@ def train_one_epoch(
 
         # ===== loss 3: per-color count (CE) =====
         # 注意：我之前函数名叫 loss_per_color_count，targets_oh shape=(B,8,11)
-        lpc, corr_pc, wrong_pc, _micro = loss_per_color_count(
+        lpc, corr_pc, wrong_pc, _micro = loss_bind(
             logits_seq=logits_color_count, # (B,S,8,11)
             targets_oh=color_count,        # (B,8,11)
             mode=loss_mode,
@@ -381,6 +396,7 @@ def train_loop(  # 完整训练循环（多 epoch）
     pos_weight: Optional[torch.Tensor] = None,  # 类别不均衡
     grad_clip_norm: Optional[float] = 1.0,  # 梯度裁剪
     val_loader=None,  # 验证 DataLoader（可选）
+    kind: str = "kind"
 ):
     model = model.to(device)  # 模型搬到 device
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)  # Adam 优化器
@@ -407,6 +423,7 @@ def train_loop(  # 完整训练循环（多 epoch）
             aux_weight=aux_weight,  # aux 权重
             pos_weight=pos_weight,  # pos_weight（可选）
             grad_clip_norm=grad_clip_norm,  # 裁剪
+            kind = kind
         )
 
         history["train_loss"].append(train_stats["loss"])  # 记录 loss

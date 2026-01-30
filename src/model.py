@@ -77,8 +77,13 @@ class ConvStem(nn.Module):  # 普通卷积前端（类似 ResNet stem 的简化�
 
 
 class TwoLayerConvGRUNet(nn.Module):  # 整体模型：stem + 两层 ConvGRU + head
-    def __init__(self, in_channels: int = 3, stem_channels: int = 64, h1_channels: int = 96, h2_channels: int = 128, num_classes: int = 8):
+    def __init__(self, in_channels: int = 3, stem_channels: int = 64, h1_channels: int = 96, h2_channels: int = 128, kind: str = "color"):
         super().__init__()  # 调父类初始化
+        self.h2_channels = h2_channels
+        self.kind = kind
+        self.num_bins = 11
+        self.num_main = 8 if kind == "color" else 3  # color=8, shape=3
+
 
         self.stem = ConvStem(in_channels=in_channels, base_channels=stem_channels)  # 普通卷积前端
 
@@ -104,14 +109,14 @@ class TwoLayerConvGRUNet(nn.Module):  # 整体模型：stem + 两层 ConvGRU + h
         self.bn_down12 = nn.GroupNorm(num_groups=32, num_channels=h2_channels)
         self.rnn2 = ConvGRUCell(in_channels=h2_channels, hidden_channels=h2_channels, kernel_size=3)  # 第二层 ConvGRU（28x28）
 
-        self.head_color = nn.Linear(h2_channels, num_classes)
-        self.head_count = nn.Linear(h2_channels, 11 )
-        self.head_per_color = nn.Linear(h2_channels, 8 * 11)
+        self.head_count = nn.Linear(h2_channels, self.num_bins)                 # 11
+        self.head_main  = nn.Linear(h2_channels, self.num_main)                 # 8 or 3
+        self.head_bind  = nn.Linear(h2_channels, self.num_main * self.num_bins) # (8*11) or (3*11)
+
 
     def forward(self, x: torch.Tensor, steps: int = 3):
         # x: (B, 3, 224, 224)  # 输入图像
         # steps: 迭代次数（模拟循环推理）  # 比如 3、5、8
-        # return_all: 是否返回每一步的 h1/h2 轨迹（用于可视化/调试）
 
         B, C, H, W = x.shape  # 解析输入维度
 
@@ -122,11 +127,11 @@ class TwoLayerConvGRUNet(nn.Module):  # 整体模型：stem + 两层 ConvGRU + h
         x1 = F.relu(x1, inplace=True)  # ReLU
 
         h1 = torch.zeros(B, x1.shape[1], x1.shape[2], x1.shape[3], device=x.device, dtype=x.dtype)  # 初始化 h1 为 0
-        h2 = torch.zeros(B, 128, x1.shape[2] // 2, x1.shape[3] // 2, device=x.device, dtype=x.dtype)  # 初始化 h2 为 0（28x28）
+        h2 = torch.zeros(B, self.h2_channels, x1.shape[2] // 2, x1.shape[3] // 2, device=x.device, dtype=x.dtype)  # 初始化 h2 为 0（28x28）
 
-        logits_colors = []  # 保存每一步color
-        logits_counts = []
-        logits_per_colors = []
+        logits_main_seq = []
+        logits_count_seq = []
+        logits_bind_seq = []
 
         for t in range(steps):  # 迭代 steps 次（输入不变，状态更新）
             h1 = self.rnn1(x1, h1)  # 第一层 ConvGRU 更新（56x56）
@@ -139,17 +144,18 @@ class TwoLayerConvGRUNet(nn.Module):  # 整体模型：stem + 两层 ConvGRU + h
 
             pooled = F.adaptive_avg_pool2d(h2, output_size=1)  # GAP -> (B, 128, 1, 1)
             pooled = pooled.view(B, -1)  # 展平 -> (B, 128)
-            logits_color = self.head_color(pooled)  # 当前步 logits -> (B, 8)
-            logits_count = self.head_count(pooled)
-            logits_per_color = self.head_per_color(pooled)
-            logits_per_color = logits_per_color.view(B, 8, 11) 
+            
+            logits_main  = self.head_main(pooled)   # (B, K)
+            logits_count = self.head_count(pooled)  # (B, 11)
+            logits_bind  = self.head_bind(pooled).view(B, self.num_main, self.num_bins)  # (B, K, 11)
 
-            logits_colors.append(logits_color)
-            logits_counts.append(logits_count)
-            logits_per_colors.append(logits_per_color)
+            logits_main_seq.append(logits_main)
+            logits_count_seq.append(logits_count)
+            logits_bind_seq.append(logits_bind)
 
-        logits_colors = torch.stack(logits_colors, dim=1)  # 堆叠 -> (B, steps, 8)
-        logits_counts = torch.stack(logits_counts, dim=1)  # 堆叠 -> (B, steps, 11)
-        logits_per_colors = torch.stack(logits_per_colors, dim=1)  # 堆叠 -> (B, steps, 8, 11)            
+        logits_main_seq  = torch.stack(logits_main_seq,  dim=1)  # (B, steps, K)
+        logits_count_seq = torch.stack(logits_count_seq, dim=1)  # (B, steps, 11)
+        logits_bind_seq  = torch.stack(logits_bind_seq,  dim=1)  # (B, steps, K, 11)
+           
 
-        return logits_colors, logits_counts, logits_per_colors  # 返回每一步 logits
+        return logits_main_seq, logits_count_seq, logits_bind_seq  # 返回每一步 logits
